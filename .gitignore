@@ -1,0 +1,17 @@
+# .gitignore for adaptive-skill-system
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.env
+.venv
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
