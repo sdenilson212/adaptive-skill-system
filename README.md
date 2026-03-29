@@ -68,42 +68,32 @@ pip install -e .
 ```python
 from adaptive_skill import AdaptiveSkillSystem, KBClient, LTMClient
 
-# 实现你自己的客户端（或使用内置 Mock）
 class MyKBClient(KBClient):
     def search(self, query, top_k=5):
-        # 对接你的知识库
         return []
-
     def save(self, entry):
         pass
 
 class MyLTMClient(LTMClient):
     def search(self, query, max_results=10):
         return []
-
     def save(self, content, category, tags):
         pass
 
-# 初始化
 system = AdaptiveSkillSystem(
     kb_client=MyKBClient(),
     ltm_client=MyLTMClient()
 )
 
-# 解题
 result = system.solve("如何制定一份针对 Z 世代的运营策略？")
-
 print(f"状态: {result.status}")
 print(f"使用层级: Layer {result.layer_used}")
 print(f"置信度: {result.skill.metadata.confidence_score:.0%}")
-for step in result.skill.steps:
-    print(f"  步骤 {step.step_number}: {step.name}")
 ```
 
 ### 反馈驱动学习
 
 ```python
-# 用户觉得结果不够好
 result2 = system.solve(
     "如何制定一份针对 Z 世代的运营策略？",
     feedback="方案里没有考虑预算约束，能加上吗？"
@@ -195,19 +185,166 @@ Adaptive Skill System（执行层）← 本项目
 
 ---
 
-## English
+## License
 
-**Adaptive Skill System** — A three-layer progressive AI skill engine that enables AI to automatically learn and evolve when facing complex problems.
-
-### Key Features
-- **Layer 1**: Direct KB cache hit (< 1s)
-- **Layer 2**: LTM-based composition (10-30s)
-- **Layer 3**: Auto-generation with 4 strategies × 7-dimension quality evaluation (1-5min)
-- **Feedback-driven learning**: AI improves from user corrections
-- **No external dependencies**: Pure Python 3.8+, stdlib only
+MIT © [sdenilson212](https://github.com/sdenilson212)
 
 ---
 
-## License
+<a name="english"></a>
+
+## English
+
+**Adaptive Skill System** — A three-layer progressive AI Skill engine that enables AI to automatically learn and evolve when facing complex problems.
+
+### The Problem
+
+Traditional AI only "gives answers". When a problem exceeds its capability, it either hallucinates or gives up.
+
+**Adaptive Skill System** changes this:
+
+> When AI cannot answer directly, instead of failing, it **automatically combines existing knowledge** or **generates a new solution strategy**.
+
+---
+
+### Three-Layer Architecture
+
+```
+User query
+    │
+    ▼
+┌─────────────────────────────────────┐
+│  Layer 1: Direct hit  (< 1s)        │
+│  Search KB cache, return cached Skill│
+└──────────────┬──────────────────────┘
+               │ Cache miss
+               ▼
+┌─────────────────────────────────────┐
+│  Layer 2: Composition  (10-30s)     │
+│  Search LTM fragments, combine      │
+└──────────────┬──────────────────────┘
+               │ Confidence too low
+               ▼
+┌─────────────────────────────────────┐
+│  Layer 3: Auto-generation  (1-5min) │
+│  4 strategies × 7-dimension scoring │
+│  Auto-save to KB on pass            │
+└─────────────────────────────────────┘
+```
+
+| Layer | Response Time | Reliability | Trigger |
+|-------|--------------|-------------|---------|
+| Layer 1 | < 1s | Highest | KB hit rate ≥ 40% |
+| Layer 2 | 10-30s | High | LTM composable |
+| Layer 3 | 1-5min | Medium | Layers 1 & 2 both failed |
+
+---
+
+### Quick Start
+
+```bash
+git clone https://github.com/sdenilson212/adaptive-skill-system.git
+cd adaptive-skill-system
+pip install -e .
+```
+
+```python
+from adaptive_skill import AdaptiveSkillSystem, KBClient, LTMClient
+
+# Implement your own clients (or use the built-in Mock)
+class MyKBClient(KBClient):
+    def search(self, query, top_k=5):
+        return []  # connect to your knowledge base
+    def save(self, entry):
+        pass
+
+class MyLTMClient(LTMClient):
+    def search(self, query, max_results=10):
+        return []  # connect to your long-term memory
+    def save(self, content, category, tags):
+        pass
+
+system = AdaptiveSkillSystem(
+    kb_client=MyKBClient(),
+    ltm_client=MyLTMClient()
+)
+
+result = system.solve("How to design a marketing strategy for Gen Z?")
+
+print(f"Status:      {result.status}")
+print(f"Layer used:  Layer {result.layer_used}")
+print(f"Confidence:  {result.skill.metadata.confidence_score:.0%}")
+for step in result.skill.steps:
+    print(f"  Step {step.step_number}: {step.name}")
+```
+
+### Feedback-Driven Learning
+
+```python
+# User is not satisfied with the initial result
+result2 = system.solve(
+    "How to design a marketing strategy for Gen Z?",
+    feedback="The plan doesn't consider budget constraints, can you add that?"
+)
+# The improved plan is automatically saved to KB — next query is faster and more accurate
+```
+
+---
+
+### Four Generation Strategies (Layer 3)
+
+| Strategy | Best For | Description |
+|----------|---------|-------------|
+| Template | Structured problems | Apply an existing framework template |
+| Analogy | Cross-domain transfer | Borrow ideas from a similar field |
+| Decomposition | Complex large problems | Break into sub-problems and solve each |
+| Hybrid | High complexity | Combine all three strategies above |
+
+Strategy selection is fully automatic, based on problem keywords, history, and complexity score.
+
+---
+
+### 7-Dimension Quality Evaluation
+
+Every auto-generated Skill is scored across 7 dimensions. **A total score ≥ 0.70 is required for auto-save**:
+
+| Dimension | Weight | Description |
+|-----------|--------|-------------|
+| Completeness | 15% | Does the solution cover all aspects? |
+| Clarity | 15% | Is the solution clearly expressed? |
+| Feasibility | 20% | Are the steps actionable? |
+| Evidence | 15% | Is the solution backed by solid reasoning? |
+| Generalizability | 10% | Can it be reused for similar problems? |
+| Novelty | 10% | Does it offer unique insight? |
+| Risk Mitigation | 15% | Does it address potential risks? |
+
+---
+
+### Running Tests
+
+```bash
+python -m pytest tests/ -v
+# Expected: 23 passed
+```
+
+---
+
+### Relationship with AI Memory System
+
+This project is the **execution layer** built on top of [AI Memory System](https://github.com/sdenilson212/ai-memory-system):
+
+```
+AI Memory System  (memory layer — stores LTM + KB)
+        ↕
+Adaptive Skill System  (execution layer — this project)
+        ↕
+Your AI application
+```
+
+Both systems can be used independently, or together for maximum effect.
+
+---
+
+### License
 
 MIT © [sdenilson212](https://github.com/sdenilson212)
