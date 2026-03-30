@@ -125,6 +125,10 @@ class Skill:
     # 版本历史
     versions: Dict[str, Dict] = field(default_factory=dict)
     
+    # 版本 DAG 谱系字段（2026-03-29 新增）
+    parent_id: Optional[str] = None          # 父 Skill ID，None 表示原创
+    evolution_type: str = "original"          # original | derived | fixed | composed | auto-generated
+    
     def to_dict(self) -> Dict:
         """转换为字典（用于存储）"""
         return {
@@ -140,7 +144,9 @@ class Skill:
             "metadata": self.metadata.to_dict(),
             "generation_info": self.generation_info.to_dict(),
             "quality_metrics": self.quality_metrics.to_dict(),
-            "versions": self.versions
+            "versions": self.versions,
+            "parent_id": self.parent_id,
+            "evolution_type": self.evolution_type,
         }
     
     @classmethod
@@ -196,7 +202,9 @@ class Skill:
             metadata=metadata,
             generation_info=generation_info,
             quality_metrics=quality_metrics,
-            versions=data.get('versions', {})
+            versions=data.get('versions', {}),
+            parent_id=data.get('parent_id', None),
+            evolution_type=data.get('evolution_type', 'original'),
         )
 
 
@@ -498,6 +506,13 @@ class AdaptiveSkillSystem:
         self.skill_composer = None
         self.skill_generator = None
         self.quality_evaluator = None
+
+        # 版本 DAG 谱系库（2026-03-29 接入）
+        try:
+            from .skill_lineage import SkillLineage
+            self.lineage = SkillLineage()
+        except Exception as _e:
+            self.lineage = None  # 谱系库不可用时降级，不影响主流程
         
         # 延迟初始化子模块
         self._initialize_submodules()
@@ -505,9 +520,9 @@ class AdaptiveSkillSystem:
     def _initialize_submodules(self):
         """初始化子模块（延迟加载）"""
         try:
-            from .skill_composer import SkillComposer
-            from .skill_generator import SkillGenerator
-            from .quality_evaluator import QualityEvaluator
+            from .composer import SkillComposer
+            from .generator import SkillGenerator
+            from .evaluator import QualityEvaluator
             
             self.skill_composer = SkillComposer(ltm_client=self.ltm, kb_client=self.kb)
             self.skill_generator = SkillGenerator(ltm_client=self.ltm)
@@ -681,6 +696,12 @@ class AdaptiveSkillSystem:
         if best_skill and best_score >= LAYER1_THRESHOLD:
             # 缓存命中的 Skill
             self.skills_cache[best_skill.skill_id] = best_skill
+            # 写入谱系库（原创/已有 Skill 的使用记录）
+            if self.lineage:
+                try:
+                    self.lineage.register(best_skill)
+                except Exception:
+                    pass
             result = self.executor.execute(best_skill, problem)
             return result, best_skill
         
@@ -735,12 +756,12 @@ class AdaptiveSkillSystem:
     def _try_layer_2(self, problem: str) -> Tuple[Optional[ExecutionResult], Optional[Skill]]:
         """第二层：从记忆中组合"""
         try:
-            from .skill_composer import SkillComposer
+            from .composer import SkillComposer
         except ImportError:
             import importlib, sys
             spec = importlib.util.spec_from_file_location(
-                "skill_composer",
-                str(__import__("pathlib").Path(__file__).parent / "skill_composer.py")
+                "composer",
+                str(__import__("pathlib").Path(__file__).parent / "composer.py")
             )
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
@@ -766,6 +787,13 @@ class AdaptiveSkillSystem:
         # 根据组合计划创建 Skill
         composed_skill = self._skill_from_composition_plan(composition_plan, problem)
         
+        # 写入谱系库（Layer 2 组合生成的新 Skill）
+        if self.lineage:
+            try:
+                self.lineage.register(composed_skill)
+            except Exception:
+                pass
+        
         # 执行 Skill
         result = self.executor.execute(composed_skill, problem)
         
@@ -774,8 +802,8 @@ class AdaptiveSkillSystem:
     def _try_layer_3(self, problem: str) -> Tuple[Optional[ExecutionResult], Optional[Skill], Optional[Dict]]:
         """第三层：自动生成"""
         try:
-            from .skill_generator import SkillGenerator
-            from .quality_evaluator import QualityEvaluator
+            from .generator import SkillGenerator
+            from .evaluator import QualityEvaluator
         except ImportError:
             import importlib
             _engine_dir = __import__("pathlib").Path(__file__).parent
@@ -786,8 +814,8 @@ class AdaptiveSkillSystem:
                 spec.loader.exec_module(mod)
                 return mod
             
-            SkillGenerator = _load("skill_generator").SkillGenerator
-            QualityEvaluator = _load("quality_evaluator").QualityEvaluator
+            SkillGenerator = _load("generator").SkillGenerator
+            QualityEvaluator = _load("evaluator").QualityEvaluator
         
         generator = SkillGenerator(ltm_client=self.ltm)
         evaluator = QualityEvaluator()
@@ -822,6 +850,14 @@ class AdaptiveSkillSystem:
         # 将草稿转换为完整 Skill
         generated_skill = self._skill_from_draft(skill_draft)
         
+        # 写入谱系库（Layer 3 自动生成的 Skill）
+        quality_score = assessment.overall_score
+        if self.lineage:
+            try:
+                self.lineage.register(generated_skill, quality_score=quality_score)
+            except Exception:
+                pass
+        
         # 执行 Skill
         result = self.executor.execute(generated_skill, problem)
         
@@ -854,14 +890,27 @@ class AdaptiveSkillSystem:
         # 分析反馈
         feedback_analysis = self._analyze_feedback(feedback)
         
+        # 保存旧 skill_id 作为 parent
+        old_skill_id = skill.skill_id
+        
         # 更新 Skill
         updated_skill = self._update_skill(skill, feedback_analysis)
+        
+        # 把旧版本设为父节点（谱系关联）
+        updated_skill.parent_id = old_skill_id
         
         # 保存更新
         if self.kb:
             self.kb.update(skill_id, updated_skill)
         
         self.skills_cache[skill_id] = updated_skill
+        
+        # 注册到谱系库（fixed 进化）
+        if self.lineage:
+            try:
+                self.lineage.register(updated_skill)
+            except Exception:
+                pass
         
         # 记录到 LTM
         if self.ltm:
@@ -938,17 +987,24 @@ class AdaptiveSkillSystem:
         skill.metadata.update_reason = feedback_analysis["suggestion"]
         skill.metadata.last_challenged_at = datetime.now()
         
-        # 更新版本
+        # 记录旧版本到谱系
         old_version = skill.version
         major, minor = map(int, old_version.split('.')[:2])
         minor += 1
-        skill.version = f"{major}.{minor}"
+        new_version = f"{major}.{minor}"
         
         # 记录到版本历史
         skill.versions[old_version] = {
             "timestamp": datetime.now().isoformat(),
-            "reason": feedback_analysis["suggestion"]
+            "reason": feedback_analysis["suggestion"],
+            "skill_id_snapshot": skill.skill_id,  # 记录此时的 ID，供 DAG 回溯
         }
+        
+        skill.version = new_version
+        
+        # 更新进化类型（被用户反馈修复 → fixed）
+        if feedback_analysis["sentiment"] == "negative":
+            skill.evolution_type = "fixed"
         
         return skill
     

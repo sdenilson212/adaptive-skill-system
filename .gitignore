@@ -15,3 +15,6 @@ venv/
 .coverage
 htmlcov/
 *.log
+
+# Personal experience log (use EXPERIENCE.template.md instead)
+EXPERIENCE.md

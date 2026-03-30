@@ -7,9 +7,9 @@ Adaptive Skill System — 自适应 Skill 系统
   Layer 3: 自动生成全新 Skill（1-5min）
 
 Usage:
-    from adaptive_skill import AdaptiveSkillSystem, KBClient, LTMClient
+    from adaptive_skill import AdaptiveSkillSystem
 
-    system = AdaptiveSkillSystem(kb_client=kb, ltm_client=ltm)
+    system = AdaptiveSkillSystem()
     result = system.solve("如何制定一份完整的运营策略？")
 """
 
@@ -20,17 +20,20 @@ from .core import (
     SkillMetadata,
     SkillStatus,
     SkillType,
-    SolveResult,
-    SolveStatus,
-    FeedbackSignal,
-    KBClient,
-    LTMClient,
+    SolveResponse,      # 实际类名（原代码写错为 SolveResult）
+    ExecutionResult,
+    SkillExecutor,
+    GenerationInfo,
+    QualityMetrics,
 )
 from .evaluator import QualityEvaluator, QualityAssessment
 from .composer import SkillComposer
 from .generator import SkillGenerator
 
-__version__ = "1.0.0"
+# Alias for backward compatibility
+SolveResult = SolveResponse
+
+__version__ = "1.0.1"
 __author__ = "sdenilson212"
 __all__ = [
     "AdaptiveSkillSystem",
@@ -39,11 +42,12 @@ __all__ = [
     "SkillMetadata",
     "SkillStatus",
     "SkillType",
-    "SolveResult",
-    "SolveStatus",
-    "FeedbackSignal",
-    "KBClient",
-    "LTMClient",
+    "SolveResponse",
+    "SolveResult",      # alias -> SolveResponse
+    "ExecutionResult",
+    "SkillExecutor",
+    "GenerationInfo",
+    "QualityMetrics",
     "QualityEvaluator",
     "QualityAssessment",
     "SkillComposer",
