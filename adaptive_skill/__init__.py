@@ -28,12 +28,96 @@ from .core import (
 )
 from .evaluator import QualityEvaluator, QualityAssessment
 from .composer import SkillComposer
-from .generator import SkillGenerator
+from .generator import (
+    SkillGenerator,
+    OllamaSkillProvider,
+    SkillGenerationProvider,
+    ProviderRouter,
+    ProviderHealthStatus,
+)
+
+from .thresholds import RuntimeThresholdPolicy, DEFAULT_THRESHOLD_POLICY
+
+from .protocols import (
+
+    TaskSpec,
+    ContextSpec,
+    DecisionTrace,
+    ExecutionResult as ProtocolExecutionResult,
+    task_spec_from_case,
+    execution_result_from_solve_response,
+    solve_task_with_protocol,
+)
+
+
+from .harness import (
+
+    CaseSpec,
+    GraderSpec,
+    GradingOutput,
+    RunResult,
+    ReportBundle,
+    WrittenReportBundle,
+    build_report_bundle,
+    build_report_data,
+    render_html_report,
+    render_markdown_report,
+    write_report_bundle,
+    run_case,
+    normalize_response,
+    grade,
+    SUPPORTED_SEMANTIC_METHODS,
+    DEFAULT_SENTENCE_TRANSFORMER_MODEL,
+    normalize_semantic_text,
+    compute_semantic_similarity,
+)
+
+
 
 # Alias for backward compatibility
 SolveResult = SolveResponse
 
-__version__ = "1.0.1"
+# 新增模块导出
+from .adapters import (
+    KBAdapter,
+    FeishuKBAdapter,
+    ConfluenceKBAdapter,
+    NotionKBAdapter,
+    GenericKBAdapter,
+    KBDocument,
+    KBCredential,
+    KBProvider,
+    create_kb_adapter,
+)
+from .feedback import (
+    FeedbackCollector,
+    FeedbackEntry,
+    FeedbackType,
+    FeedbackStatus,
+    FeedbackStorage,
+    FeedbackAnalyzer,
+)
+from .observability import (
+    MetricsCollector,
+    DashboardData,
+    AlertManager,
+    MetricType,
+    MetricEntry,
+    SystemMetrics,
+    LayerMetrics,
+)
+from .multi_tenant import (
+    TenantContext,
+    TenantManager,
+    TenantIsolation,
+    AccessControl,
+    TenantConfig,
+    Permission,
+    Role,
+)
+
+__version__ = "1.1.0"
+
 __author__ = "sdenilson212"
 __all__ = [
     "AdaptiveSkillSystem",
@@ -52,4 +136,80 @@ __all__ = [
     "QualityAssessment",
     "SkillComposer",
     "SkillGenerator",
+    "SkillGenerationProvider",
+    "OllamaSkillProvider",
+    "ProviderRouter",
+    "ProviderHealthStatus",
+
+    "RuntimeThresholdPolicy",
+    "DEFAULT_THRESHOLD_POLICY",
+    "TaskSpec",
+    "DecisionTrace",
+
+    "ContextSpec",
+
+    "ProtocolExecutionResult",
+    "task_spec_from_case",
+    "execution_result_from_solve_response",
+    "solve_task_with_protocol",
+    "CaseSpec",
+
+
+    "GraderSpec",
+    "GradingOutput",
+    "RunResult",
+    "ReportBundle",
+    "WrittenReportBundle",
+    "build_report_data",
+    "render_markdown_report",
+    "render_html_report",
+    "build_report_bundle",
+    "write_report_bundle",
+    "run_case",
+    "normalize_response",
+    "grade",
+    "SUPPORTED_SEMANTIC_METHODS",
+    "DEFAULT_SENTENCE_TRANSFORMER_MODEL",
+    "normalize_semantic_text",
+    "compute_semantic_similarity",
+    
+    # 知识库适配器
+    "KBAdapter",
+    "FeishuKBAdapter",
+    "ConfluenceKBAdapter",
+    "NotionKBAdapter",
+    "GenericKBAdapter",
+    "KBDocument",
+    "KBCredential",
+    "KBProvider",
+    "create_kb_adapter",
+    
+    # 用户反馈
+    "FeedbackCollector",
+    "FeedbackEntry",
+    "FeedbackType",
+    "FeedbackStatus",
+    "FeedbackStorage",
+    "FeedbackAnalyzer",
+    
+    # 可观测性
+    "MetricsCollector",
+    "DashboardData",
+    "AlertManager",
+    "MetricType",
+    "MetricEntry",
+    "SystemMetrics",
+    "LayerMetrics",
+    
+    # 多租户
+    "TenantContext",
+    "TenantManager",
+    "TenantIsolation",
+    "AccessControl",
+    "TenantConfig",
+    "Permission",
+    "Role",
 ]
+
+
+
