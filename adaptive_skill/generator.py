@@ -95,6 +95,61 @@ class SkillGenerationProvider(Protocol):
         """返回结构化 Skill 草稿 payload；失败时返回 None。"""
 
 
+ALLOWED_LOCALHOSTS = frozenset([
+    "localhost",
+    "127.0.0.1",
+    "::1",
+])
+
+ALLOWED_NETWORKS = frozenset([
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+])
+
+
+def _is_allowed_ollama_host(base_url: str) -> bool:
+    """检查 Ollama base_url 是否指向安全地址（本地/私有网络）。
+    
+    防止 SSRF 攻击：禁止向公网 IP 发送 prompt + context 数据。
+    """
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(base_url)
+        host = parsed.hostname or ""
+        port = parsed.port or 11434
+        scheme = parsed.scheme.lower()
+        
+        # 只允许 http/https
+        if scheme not in ("http", "https"):
+            return False
+        
+        # localhost / 127.0.0.1 / ::1 → 允许
+        if host in ALLOWED_LOCALHOSTS:
+            return True
+        
+        # 显式允许的私有网段 → 允许（生产环境建议配置 OLLAMA_ALLOWED_NETWORKS）
+        import os
+        allowed_nets = os.environ.get("OLLAMA_ALLOWED_NETWORKS", "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16")
+        for cidr in allowed_nets.split(","):
+            cidr = cidr.strip()
+            if _ip_in_cidr(host, cidr):
+                return True
+        
+        return False
+    except Exception:
+        return False
+
+
+def _ip_in_cidr(ip: str, cidr: str) -> bool:
+    """检查 IP 是否在 CIDR 范围内。"""
+    import ipaddress
+    try:
+        return ipaddress.ip_address(ip) in ipaddress.ip_network(cidr, strict=False)
+    except Exception:
+        return False
+
+
 class OllamaSkillProvider:
     """基于本地 Ollama 的 Skill 草稿生成提供者。"""
 
@@ -108,6 +163,13 @@ class OllamaSkillProvider:
         max_retries: int = 3,
         retry_base_delay: float = 1.0,
     ):
+        # 安全检查：禁止向非本地/私有网络发送请求
+        if not _is_allowed_ollama_host(base_url):
+            raise ValueError(
+                f"Ollama base_url '{base_url}' 指向非安全地址。"
+                "仅允许 localhost 或私有网络 (10.x.x.x, 172.16-31.x.x, 192.168.x.x)。"
+                "可通过环境变量 OLLAMA_ALLOWED_NETWORKS 配置私有网段。"
+            )
         self.model = model
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
