@@ -9,22 +9,17 @@
   - AdaptiveSkillSystem.solve 无客户端降级路径
 """
 
-import sys
-import os
-from pathlib import Path
 from datetime import datetime
-
-# 确保 engine 目录在导入路径中
-engine_dir = Path(__file__).parent.parent / "engine"
-sys.path.insert(0, str(engine_dir))
 
 import pytest
 
-from adaptive_skill_system import (
+from adaptive_skill import (
+
     Skill, SkillStep, SkillMetadata, GenerationInfo, QualityMetrics,
     SkillStatus, SkillType, SkillExecutor, AdaptiveSkillSystem,
-    ExecutionResult, SolveResponse
+    ExecutionResult, SolveResponse, RuntimeThresholdPolicy
 )
+
 
 
 # ─────────────────────────────────────────────
@@ -204,7 +199,22 @@ class TestLayer1:
         assert matched_skill is not None
         assert matched_skill.skill_id == "layer1-001"
 
+    def test_layer1_respects_custom_threshold_policy(self, monkeypatch):
+        """Layer 1 应使用共享 threshold policy，而不是 core 内部硬编码阈值。"""
+        policy = RuntimeThresholdPolicy().with_overrides(layer1_direct_match_threshold=0.35)
+        system = AdaptiveSkillSystem(threshold_policy=policy)
+        skill = make_skill(skill_id="policy-001", name="阈值策略测试 Skill", description="用于校验共享阈值策略")
+        system.skills_cache[skill.skill_id] = skill
+
+        monkeypatch.setattr(system, "_compute_skill_relevance", lambda *args, **kwargs: 0.36)
+
+        result, matched_skill = system._try_layer_1("任意问题")
+        assert result is not None
+        assert matched_skill is not None
+        assert matched_skill.skill_id == "policy-001"
+
     def test_cache_miss_below_threshold(self):
+
         """缓存中没有相关 Skill，Layer 1 应返回 None"""
         skill = make_skill(
             skill_id="irrelevant-001",
@@ -276,9 +286,39 @@ class TestSolveWithNoClients:
             assert response.status == "success"
             assert response.confidence >= 0.0
 
+    def test_solve_uses_custom_layer3_policy(self, monkeypatch):
+        """Layer 3 的 success/partial 与 needs_feedback 应走共享 policy。"""
+        policy = RuntimeThresholdPolicy().with_overrides(
+            layer3_success_status_threshold=0.70,
+            layer3_verification_threshold=0.80,
+        )
+        system = AdaptiveSkillSystem(threshold_policy=policy)
+        generated_skill = make_skill(skill_id="generated-001", name="自动生成 Skill")
+        generated_result = ExecutionResult(
+            success=True,
+            output={"result": "ok"},
+            duration_seconds=0.05,
+            steps_completed=3,
+            total_steps=3,
+        )
+
+        monkeypatch.setattr(system, "_try_layer_1", lambda problem: (None, None))
+        monkeypatch.setattr(system, "_try_layer_2", lambda problem: (None, None))
+        monkeypatch.setattr(
+            system,
+            "_try_layer_3",
+            lambda problem: (generated_result, generated_skill, {"quality": 0.72}),
+        )
+
+        response = system.solve("请生成一个新 Skill")
+        assert response.layer == 3
+        assert response.status == "success"
+        assert response.metadata["needs_feedback"] is True
+
 
 # ─────────────────────────────────────────────
 # 6. _skill_from_kb_entry — KB 条目包装
+
 # ─────────────────────────────────────────────
 
 class TestSkillFromKBEntry:

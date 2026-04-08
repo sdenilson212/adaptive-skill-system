@@ -496,7 +496,7 @@ class SkillFeedbackStats:
     avg_rating: Optional[float] = None
     correction_count: int = 0
     report_count: int = 0
-    satisfaction_rate: float = 0.0  # (thumbs_up) / (thumbs_up + thumbs_down)
+    satisfaction_rate: float = 0.0  # 优先使用二元反馈；缺失时回退到评分折算
     
     # 建议
     recommendation: Optional[str] = None
@@ -567,6 +567,9 @@ class FeedbackAnalyzer:
         # 计算平均评分
         if ratings:
             stats.avg_rating = sum(ratings) / len(ratings)
+            if total_binary == 0:
+                # ratings-only 场景下回退到评分折算，避免把高分误判成 0% 满意度
+                stats.satisfaction_rate = stats.avg_rating / 5
         
         # 生成建议
         stats.recommendation = self._generate_recommendation(stats)

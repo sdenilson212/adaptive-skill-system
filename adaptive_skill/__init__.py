@@ -84,11 +84,13 @@ from .adapters import (
     ConfluenceKBAdapter,
     NotionKBAdapter,
     GenericKBAdapter,
+    MemoryKBAdapter,
     KBDocument,
     KBCredential,
     KBProvider,
     create_kb_adapter,
 )
+
 from .feedback import (
     FeedbackCollector,
     FeedbackEntry,
@@ -116,7 +118,7 @@ from .multi_tenant import (
     Role,
 )
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 __author__ = "sdenilson212"
 __all__ = [
@@ -179,7 +181,9 @@ __all__ = [
     "ConfluenceKBAdapter",
     "NotionKBAdapter",
     "GenericKBAdapter",
+    "MemoryKBAdapter",
     "KBDocument",
+
     "KBCredential",
     "KBProvider",
     "create_kb_adapter",

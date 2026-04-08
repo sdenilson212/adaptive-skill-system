@@ -356,11 +356,11 @@ class TenantIsolation:
         self._kb = kb_adapter
         self._ltm = ltm_adapter
     
-    def _get_tenant_id(self) -> str:
-        """获取当前租户 ID"""
+    def _get_tenant_id(self) -> Optional[str]:
+        """获取当前租户 ID；如果没有租户上下文则返回 None（passthrough 模式）"""
         ctx = TenantContext.get_current()
         if not ctx:
-            raise RuntimeError("No tenant context set")
+            return None
         return ctx.tenant_id
     
     def _prefix_doc_id(self, doc_id: str, tenant_id: str) -> str:
@@ -379,59 +379,115 @@ class TenantIsolation:
                   filters: Optional[Dict[str, Any]] = None) -> List["KBDocument"]:
         """
         搜索当前租户的 KB
-        
-        自动过滤，只返回当前租户的数据。
+
+        - 有租户 context：自动叠加 tenant_id 过滤，只返回当前租户数据。
+        - 无租户 context（passthrough 模式）：直接透传给 raw client，不加过滤。
+        - 不修改调用方传入的 filters 字典。
+        - 自动兼容不接受 filters 参数的 raw client（如 benchmark stub）。
         """
         if not self._kb:
             return []
-        
+
         tenant_id = self._get_tenant_id()
-        
-        # 添加租户过滤
-        if filters is None:
-            filters = {}
-        filters["tenant_id"] = tenant_id
-        
-        return self._kb.search(query, top_k, filters)
+
+        if tenant_id is not None:
+            # 租户模式：叠加 tenant_id 过滤（操作副本）
+            effective_filters = dict(filters) if filters is not None else {}
+            effective_filters["tenant_id"] = tenant_id
+        else:
+            # passthrough 模式：使用调用方原始 filters（不复制，直接用）
+            effective_filters = filters
+
+        # 兼容不支持 filters 参数的 raw client
+        import inspect
+        try:
+            sig = inspect.signature(self._kb.search)
+            params = list(sig.parameters.keys())
+            if len(params) >= 3 or any(
+                p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD)
+                for p in sig.parameters.values()
+            ):
+                return self._kb.search(query, top_k, effective_filters)
+            else:
+                return self._kb.search(query, top_k)
+        except (ValueError, TypeError):
+            # inspect 失败时，尝试先带 filters，再 fallback 无 filters
+            try:
+                return self._kb.search(query, top_k, effective_filters)
+            except TypeError:
+                return self._kb.search(query, top_k)
     
     def get_kb_doc(self, doc_id: str) -> Optional["KBDocument"]:
-        """获取当前租户的 KB 文档"""
+        """获取当前租户的 KB 文档。
+
+        - 有租户 context：自动补租户前缀后查询。
+        - 无租户 context（passthrough 模式）：直接透传原始 doc_id。
+        """
         if not self._kb:
             return None
-        
+
         tenant_id = self._get_tenant_id()
-        full_id = self._prefix_doc_id(doc_id, tenant_id)
-        return self._kb.get(full_id)
+        target_id = self._prefix_doc_id(doc_id, tenant_id) if tenant_id is not None else doc_id
+        return self._kb.get(target_id)
+
     
     def save_kb_doc(self, doc: "KBDocument") -> bool:
-        """保存文档到当前租户的 KB"""
+        """保存文档到当前租户的 KB（不修改入参原始对象）
+
+        - 有租户 context：在 doc_id 前加租户前缀，metadata 注入 tenant_id。
+        - 无租户 context（passthrough 模式）：直接保存，不修改任何字段。
+        """
         if not self._kb:
             return False
-        
+
         tenant_id = self._get_tenant_id()
-        
-        # 添加租户信息到文档
-        doc.doc_id = self._prefix_doc_id(doc.doc_id, tenant_id)
-        doc.metadata["tenant_id"] = tenant_id
-        
-        return self._kb.save(doc)
+
+        if tenant_id is None:
+            # passthrough 模式：直接保存，不改 doc
+            return self._kb.save(doc)
+
+        # 租户模式：操作副本，保护调用方持有的原始对象
+        import copy
+        doc_copy = copy.copy(doc)
+        doc_copy.doc_id = self._prefix_doc_id(doc.doc_id, tenant_id)
+        doc_copy.metadata = dict(doc.metadata)
+        doc_copy.metadata["tenant_id"] = tenant_id
+
+        return self._kb.save(doc_copy)
     
     def search_ltm(self,
                    query: str,
                    max_results: int = 10) -> List[Dict[str, Any]]:
-        """搜索当前租户的 LTM"""
+        """搜索当前租户的 LTM
+
+        - 有租户 context：只返回当前租户数据。
+        - 无租户 context（passthrough 模式）：直接透传，不过滤。
+        """
         if not self._ltm:
             return []
-        
+
         tenant_id = self._get_tenant_id()
-        
-        # 添加租户过滤
-        results = self._ltm.search(query, max_results * 2)  # 多拉一些，再过滤
-        
-        # 过滤当前租户的数据
+
+        if tenant_id is None:
+            # passthrough 模式：直接透传给 raw LTM client
+            import inspect
+            try:
+                sig = inspect.signature(self._ltm.recall)
+                if len(sig.parameters) >= 2:
+                    return self._ltm.recall(query, max_results)
+                else:
+                    return self._ltm.recall(query)
+            except (ValueError, TypeError):
+                try:
+                    return self._ltm.recall(query, max_results)
+                except TypeError:
+                    return self._ltm.recall(query)
+
+        # 租户模式：多拉再过滤
+        results = self._ltm.recall(query, max_results * 2)
         return [
             r for r in results
-            if r.get("metadata", {}).get("tenant_id") == tenant_id
+            if isinstance(r, dict) and r.get("metadata", {}).get("tenant_id") == tenant_id
         ][:max_results]
     
     def save_ltm(self,
@@ -450,6 +506,46 @@ class TenantIsolation:
             "tags": tags,
             "metadata": {"tenant_id": tenant_id},
         })
+
+    # Compatibility layer - wrapper methods for existing code interfaces
+    
+    def search(self, query: str, top_k: int = 5, filters: Optional[Dict[str, Any]] = None):
+        return self.search_kb(query, top_k, filters)
+    
+    def get(self, doc_id: str) -> Optional[Any]:
+        return self.get_kb_doc(doc_id)
+    
+    def save(self, doc: Any) -> bool:
+        """Compatibility proxy:
+        - 如果是 KB 模式（有 _kb）：走 save_kb_doc()
+        - 如果是 LTM 模式（无 _kb 但有 _ltm）：透传给 raw LTM client.save()
+        - passthrough（无 tenant context）：直接保存
+        """
+        if self._kb:
+            return self.save_kb_doc(doc)
+        if self._ltm:
+            try:
+                result = self._ltm.save(doc)
+                return result is not None
+            except Exception:
+                return False
+        return False
+    
+    def update(self, doc_id: str, updates: Dict[str, Any]) -> bool:
+        """更新当前租户的 KB 文档。
+
+        - 有租户 context：自动补租户前缀后更新。
+        - 无租户 context（passthrough 模式）：直接透传原始 doc_id。
+        """
+        if not self._kb:
+            return False
+        tenant_id = self._get_tenant_id()
+        target_id = self._prefix_doc_id(doc_id, tenant_id) if tenant_id is not None else doc_id
+        return self._kb.update(target_id, updates)
+
+    
+    def recall(self, query: str, max_results: int = 10) -> List[Dict[str, Any]]:
+        return self.search_ltm(query, max_results)
 
 
 # ---------------------------------------------------------------------------

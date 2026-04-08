@@ -6,6 +6,7 @@
 - ConfluenceKBAdapter: Confluence
 - NotionKBAdapter: Notion
 - GenericKBAdapter: 通用 REST API 适配器
+- MemoryKBAdapter: 纯内存适配器（测试 / 本地隔离验证）
 """
 
 from .kb_adapters import (
@@ -14,6 +15,7 @@ from .kb_adapters import (
     ConfluenceKBAdapter,
     NotionKBAdapter,
     GenericKBAdapter,
+    MemoryKBAdapter,
     KBDocument,
     KBCredential,
     KBProvider,
@@ -26,6 +28,7 @@ __all__ = [
     "ConfluenceKBAdapter",
     "NotionKBAdapter",
     "GenericKBAdapter",
+    "MemoryKBAdapter",
     "KBDocument",
     "KBCredential",
     "KBProvider",

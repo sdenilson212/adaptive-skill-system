@@ -110,12 +110,36 @@ class RuntimeThresholdPolicy:
         return replace(self, **kwargs)
 
     def layer2_allows_composition(self, composability_score: float) -> bool:
+        """Check if Layer 2 composability score meets threshold.
+        
+        Args:
+            composability_score: Score from 0-1 indicating how well components can be combined.
+        
+        Returns:
+            True if score >= 0.65 threshold, indicating viable composition.
+        """
         return composability_score >= self.layer2_composability_threshold
 
     def layer2_high_relevance_passes(self, relevance_score: float) -> bool:
+        """Check if LTM memory relevance is high enough for direct use.
+        
+        Args:
+            relevance_score: Score from 0-1 from weighted_term_coverage.
+        
+        Returns:
+            True if score >= 0.60 threshold for high-relevance memories.
+        """
         return relevance_score >= self.layer2_high_relevance_threshold
 
     def layer2_step_match_passes(self, score: float) -> bool:
+        """Check if a step matches well enough to include in composition.
+        
+        Args:
+            score: Step relevance score from 0-1.
+        
+        Returns:
+            True if score > 0.30 threshold.
+        """
         return score > self.layer2_step_match_threshold
 
     def layer2_should_warn_framework_majority(
@@ -123,6 +147,18 @@ class RuntimeThresholdPolicy:
         framework_fallback_count: int,
         total_components: int,
     ) -> bool:
+        """Check if too many components are using framework fallback.
+        
+        When >50% of components fall back to generic framework templates,
+        the composition quality degrades and should trigger a warning.
+        
+        Args:
+            framework_fallback_count: Number of components using framework fallback.
+            total_components: Total number of components in composition.
+        
+        Returns:
+            True if framework fallback ratio > 0.50.
+        """
         if total_components <= 0:
             return False
         return (framework_fallback_count / total_components) > self.layer2_framework_majority_ratio
@@ -134,6 +170,20 @@ class RuntimeThresholdPolicy:
         framework_steps: int,
         total_steps: int,
     ) -> float:
+        """Calculate confidence for Layer 2 composed skill.
+        
+        Base confidence starts at 0.75, with penalties for:
+        - High complexity: -0.10
+        - Framework majority: -0.15
+        
+        Args:
+            complexity_level: "low", "medium", or "high".
+            framework_steps: Number of steps using framework fallback.
+            total_steps: Total number of steps in composition.
+        
+        Returns:
+            Adjusted confidence score (floor 0.0).
+        """
         confidence = self.layer2_strategy_base_confidence
         if complexity_level == "high":
             confidence -= self.layer2_complexity_penalty
@@ -142,18 +192,73 @@ class RuntimeThresholdPolicy:
         return max(confidence, 0.0)
 
     def layer2_composed_needs_verification(self, estimated_quality: float) -> bool:
+        """Check if composed skill needs human verification.
+        
+        Skills with estimated quality < 0.80 should be flagged for review
+        before being committed to the knowledge base.
+        
+        Args:
+            estimated_quality: Predicted quality score from 0-1.
+        
+        Returns:
+            True if quality < 0.80 verification threshold.
+        """
         return estimated_quality < self.layer2_composed_verification_threshold
 
     def layer3_quality_passes(self, score: float) -> bool:
+        """Check if Layer 3 generated skill passes quality gate.
+        
+        This is the hard gate - skills below 0.70 are rejected entirely.
+        
+        Args:
+            score: Overall quality score from 0-1.
+        
+        Returns:
+            True if score >= 0.70 quality gate threshold.
+        """
         return score >= self.layer3_quality_gate_threshold
 
     def layer3_status_for_quality(self, score: float) -> str:
+        """Determine success/partial status for Layer 3 skill.
+        
+        - score >= 0.75: "success" (can save to KB)
+        - score < 0.75: "partial" (needs refinement)
+        
+        Args:
+            score: Overall quality score from 0-1.
+        
+        Returns:
+            "success" or "partial" status string.
+        """
         return "success" if score >= self.layer3_success_status_threshold else "partial"
 
     def layer3_needs_feedback(self, score: float) -> bool:
+        """Check if skill quality is borderline and needs user feedback.
+        
+        Skills scoring 0.70-0.85 pass the gate but should prompt for
+        user feedback to improve future generations.
+        
+        Args:
+            score: Overall quality score from 0-1.
+        
+        Returns:
+            True if score < 0.85 verification threshold.
+        """
         return score < self.layer3_verification_threshold
 
     def layer3_confidence_level(self, score: float) -> str:
+        """Map quality score to confidence level string.
+        
+        - score >= 0.85: "high"
+        - score >= 0.70: "medium"
+        - score < 0.70: "low"
+        
+        Args:
+            score: Quality score from 0-1.
+        
+        Returns:
+            "high", "medium", or "low".
+        """
         if score >= self.layer3_verification_threshold:
             return "high"
         if score >= self.layer3_quality_gate_threshold:
@@ -161,12 +266,43 @@ class RuntimeThresholdPolicy:
         return "low"
 
     def layer3_template_confidence(self, best_score: float) -> float:
+        """Calculate confidence for template-based generation.
+        
+        Base 0.70 + match_score * 0.20, capped at 0.85.
+        
+        Args:
+            best_score: Best template match score from 0-1.
+        
+        Returns:
+            Confidence score for template-based skill.
+        """
         return self.layer3_template_base_confidence + best_score * self.layer3_template_match_multiplier
 
     def layer3_analogy_confidence(self, similarity: float) -> float:
+        """Calculate confidence for analogy-based generation.
+        
+        Base 0.75 + similarity * 0.20, typically higher than template.
+        
+        Args:
+            similarity: Similarity score to analog skill from 0-1.
+        
+        Returns:
+            Confidence score for analogy-based skill.
+        """
         return self.layer3_analogy_base_confidence + similarity * self.layer3_analogy_similarity_multiplier
 
     def layer3_decomposition_confidence(self, sub_problem_count: int) -> float:
+        """Calculate confidence for decomposition-based generation.
+        
+        Base 0.65 + 0.05 per sub-problem, capped at 0.85.
+        More sub-problems = more structured approach = higher confidence.
+        
+        Args:
+            sub_problem_count: Number of sub-problems identified.
+        
+        Returns:
+            Confidence score for decomposition-based skill.
+        """
         confidence = self.layer3_decomposition_base_confidence + self.layer3_decomposition_step_bonus * sub_problem_count
         return min(confidence, self.layer3_confidence_cap)
 
@@ -176,6 +312,18 @@ class RuntimeThresholdPolicy:
         enhancement_count: int,
         total_steps: int,
     ) -> float:
+        """Calculate confidence for hybrid (template + enhancements) generation.
+        
+        Adds 0.10 bonus per enhancement ratio to base template confidence.
+        
+        Args:
+            template_confidence: Base confidence from template match.
+            enhancement_count: Number of enhancement steps added.
+            total_steps: Total steps in final skill.
+        
+        Returns:
+            Enhanced confidence score, capped at 0.85.
+        """
         if total_steps <= 0:
             return min(template_confidence, self.layer3_confidence_cap)
         confidence = template_confidence + self.layer3_hybrid_enhancement_bonus * (enhancement_count / total_steps)
@@ -188,6 +336,21 @@ class RuntimeThresholdPolicy:
         provider_payload_used: bool,
         has_ltm_support: bool,
     ) -> float:
+        """Calculate base confidence for Layer 3 generation.
+        
+        Hierarchy:
+        1. Start with mode base (heuristic=0.65, llm_assisted=0.75)
+        2. Upgrade to 0.78 if provider payload used
+        3. Add 0.07 bonus if LTM support available
+        
+        Args:
+            generation_mode: "heuristic" or "llm_assisted".
+            provider_payload_used: Whether external provider contributed.
+            has_ltm_support: Whether LTM memories were used.
+        
+        Returns:
+            Base confidence score before quality evaluation.
+        """
         if generation_mode == "llm_assisted":
             base_confidence = self.layer3_llm_assisted_base_confidence
         else:

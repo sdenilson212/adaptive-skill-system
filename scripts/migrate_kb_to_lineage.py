@@ -4,8 +4,9 @@ migrate_kb_to_lineage.py
 把 knowledge-base.md 里现有的 KB 条目全部导入 SQLite 谱系库。
 
 运行方式：
-    cd c:\\Users\\sdenilson\\WorkBuddy\\Claw\\output\\adaptive-skill-system
+    cd <repo-root>/output/adaptive-skill-system
     C:\\Python314\\python.exe migrate_kb_to_lineage.py
+
 
 导入规则：
     - 所有存量条目 parent_id=None，evolution_type='original'
@@ -20,21 +21,21 @@ import importlib.util
 from pathlib import Path
 
 # 路径配置
-KB_PATH = Path(
-    "C:/Users/sdenilson/WorkBuddy/Claw/output/ai-memory-system"
-    "/engine/memory-bank/knowledge-base.md"
-)
-LINEAGE_DB = Path(
-    "C:/Users/sdenilson/WorkBuddy/Claw/output/ai-memory-system"
-    "/engine/memory-bank/skill_lineage.db"
-)
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 # 直接从文件路径导入 SkillLineage，绕过 __init__.py 的版本冲突
-_lineage_file = Path(__file__).parent / "adaptive_skill" / "skill_lineage.py"
+_lineage_file = PROJECT_ROOT / "adaptive_skill" / "skill_lineage.py"
 _spec = importlib.util.spec_from_file_location("skill_lineage", _lineage_file)
 _mod  = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 SkillLineage = _mod.SkillLineage
+resolve_default_memory_bank_dir = _mod.resolve_default_memory_bank_dir
+resolve_default_db_path = _mod.resolve_default_db_path
+
+MEMORY_BANK_DIR = resolve_default_memory_bank_dir()
+KB_PATH = MEMORY_BANK_DIR / "knowledge-base.md"
+LINEAGE_DB = resolve_default_db_path()
+
 
 
 def confidence_to_score(conf):
@@ -136,9 +137,8 @@ def run_migration():
 
 def _write_result(lines):
     """把结果写到文件（绕过 PowerShell 输出吞噬）"""
-    out_path = Path(
-        "C:/Users/sdenilson/WorkBuddy/Claw/output/migrate_lineage_result.txt"
-    )
+    out_path = PROJECT_ROOT / "output" / "migrate_lineage_result.txt"
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))

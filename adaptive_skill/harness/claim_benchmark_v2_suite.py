@@ -233,17 +233,75 @@ class ClaimBenchmarkV2KBClient:
         }
 
     def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """增强版 KB search：优先返回 title 匹配的条目
+        
+        解决 L2 case 被误路由到 L1 的问题：
+        - L1 case：问题关键词与 KB title 高度匹配
+        - L2 case：问题关键词仅与 KB tags 或 content 匹配，但 title 不匹配
+        
+        通过将 title 匹配的条目排在前面，让 L1 阈值判断更准确
+        """
         q = str(query or "")
-        results = []
+        q_lower = q.lower()
+        
+        title_matches = []  # title 直接匹配
+        tag_matches = []    # tags 匹配
+        content_matches = []  # content 匹配
+        
         for skill in self._skills.values():
             title = skill.get("title", "")
             content = skill.get("content", "")
             tags = skill.get("tags", [])
-            searchable = f"{title} {content} {' '.join(tags)}"
-            if (any(t in q for t in tags) or
-                    any(word in q for word in title.split() if len(word) >= 2) or
-                    any(word in q for word in content.split() if len(word) >= 2)):
-                results.append(skill)
+            title_lower = title.lower()
+            
+            # 计算各字段匹配得分
+            title_score = 0
+            tag_score = 0
+            content_score = 0
+            
+            # 提取问题中的关键词（长度>=2的中文词）
+            import re
+            q_keywords = set(re.findall(r'[\u4e00-\u9fff]{2,}', q_lower))
+            
+            # 检查 title 匹配（权重最高）
+            title_keywords = set(re.findall(r'[\u4e00-\u9fff]{2,}', title_lower))
+            title_overlap = q_keywords & title_keywords
+            if title_overlap:
+                title_score = len(title_overlap) * 3  # title 匹配权重最高
+            
+            # 检查 tags 匹配
+            tags_lower = [t.lower() for t in tags]
+            tags_text = ' '.join(tags_lower)
+            tags_keywords = set(re.findall(r'[\u4e00-\u9fff]{2,}', tags_text))
+            tag_overlap = q_keywords & tags_keywords
+            if tag_overlap:
+                tag_score = len(tag_overlap) * 1
+            
+            # 检查 content 匹配
+            content_keywords = set(re.findall(r'[\u4e00-\u9fff]{2,}', content.lower()))
+            content_overlap = q_keywords & content_keywords
+            if content_overlap:
+                content_score = len(content_overlap) * 0.5
+            
+            total_score = title_score + tag_score + content_score
+            
+            if total_score > 0:
+                # 根据主要匹配来源分类
+                if title_score >= 3:
+                    title_matches.append((skill, total_score, title_score))
+                elif tag_score >= 1:
+                    tag_matches.append((skill, total_score, title_score))
+                else:
+                    content_matches.append((skill, total_score, title_score))
+        
+        # 按优先级和分数排序
+        title_matches.sort(key=lambda x: (-x[2], -x[1]))
+        tag_matches.sort(key=lambda x: (-x[2], -x[1]))
+        content_matches.sort(key=lambda x: (-x[2], -x[1]))
+        
+        # 合并结果：title 匹配优先
+        results = [m[0] for m in title_matches] + [m[0] for m in tag_matches] + [m[0] for m in content_matches]
+        
         return results[:top_k]
 
     def get(self, skill_id: str) -> Optional[Dict[str, Any]]:

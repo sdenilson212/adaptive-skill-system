@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: setup.py
+
+      - name: Install package and dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .[dev]
+
+      - name: Prepare artifact directories
+        run: |
+          mkdir -p .ci-artifacts/harness .ci-artifacts/reports
+          mkdir -p .ci-artifacts/real-benchmark
+
+
+      - name: Run test suite
+        run: python -m pytest tests -q --junitxml .ci-artifacts/pytest.xml
+
+      - name: Generate deterministic harness smoke batch
+        run: |
+          python scripts/run_harness_ci_suite.py \
+            --output-dir .ci-artifacts/harness \
+            --batch-file harness-batch-result.json \
+            --metrics-file harness-metrics.json
+
+      - name: Generate seeded real benchmark bundle (advisory only)
+        run: |
+          python scripts/run_harness_real_benchmark.py \
+            --output-dir .ci-artifacts/real-benchmark \
+            --baseline harness_baselines/real-benchmark-v2.json \
+            --title "Adaptive Skill Harness Real Benchmark (CI Artifact)"
+
+
+      - name: Generate harness report bundle and enforce regression gate
+        run: |
+          adaptive-skill-report .ci-artifacts/harness/harness-batch-result.json \
+            --baseline harness_baselines/ci-smoke-v1.json \
+            --output-dir .ci-artifacts/reports \
+            --file-stem adaptive-skill-harness-ci \
+            --title "Adaptive Skill Harness CI Report" \
+            --fail-on-regression
+
+
+      - name: Upload CI artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: adaptive-skill-system-ci-artifacts
+          path: .ci-artifacts/
+          if-no-files-found: error

@@ -24,11 +24,35 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 
-# 默认 DB 文件路径（与 knowledge-base.md 同目录）
-DEFAULT_DB_PATH = (
-    Path("C:/Users/sdenilson/WorkBuddy/Claw/output/ai-memory-system"
-         "/engine/memory-bank/skill_lineage.db")
-)
+# 默认 DB 文件路径（优先与 ai-memory-system 的 memory-bank 保持同目录）
+def resolve_default_memory_bank_dir() -> Path:
+    """Resolve the shared memory-bank directory without hard-coding a machine path."""
+
+    explicit_dir = os.getenv("ADAPTIVE_SKILL_MEMORY_DIR") or os.getenv("MEMORY_DIR")
+    if explicit_dir:
+        return Path(explicit_dir).expanduser()
+
+    project_root = Path(__file__).resolve().parents[1]
+    sibling_memory_dir = project_root.parent / "ai-memory-system" / "engine" / "memory-bank"
+    if sibling_memory_dir.exists():
+        return sibling_memory_dir
+
+    return project_root / "memory-bank"
+
+
+
+def resolve_default_db_path() -> Path:
+    """Resolve the lineage SQLite path with env override support."""
+
+    explicit_db_path = os.getenv("ADAPTIVE_SKILL_LINEAGE_DB")
+    if explicit_db_path:
+        return Path(explicit_db_path).expanduser()
+
+    return resolve_default_memory_bank_dir() / "skill_lineage.db"
+
+
+DEFAULT_DB_PATH = resolve_default_db_path()
+
 
 
 class SkillLineage:
@@ -81,15 +105,43 @@ class SkillLineage:
                     FOREIGN KEY (parent_id) REFERENCES skill_lineage(id)
                 );
 
+                CREATE TABLE IF NOT EXISTS failed_drafts (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    draft_skill_id  TEXT,
+                    draft_name      TEXT,
+                    problem         TEXT NOT NULL,
+                    failure_stage   TEXT NOT NULL DEFAULT 'quality_evaluation',
+                    failure_reason  TEXT NOT NULL,
+                    quality_score   REAL,
+                    recommendations TEXT NOT NULL DEFAULT '[]',
+                    draft_content   TEXT NOT NULL,
+                    extra           TEXT,
+                    created_at      TEXT NOT NULL
+                );
+
                 -- 快速查父子关系的索引
                 CREATE INDEX IF NOT EXISTS idx_parent ON skill_lineage(parent_id);
                 CREATE INDEX IF NOT EXISTS idx_status  ON skill_lineage(status);
                 CREATE INDEX IF NOT EXISTS idx_etype   ON skill_lineage(evolution_type);
+                CREATE INDEX IF NOT EXISTS idx_failed_drafts_created_at ON failed_drafts(created_at);
+                CREATE INDEX IF NOT EXISTS idx_failed_drafts_stage ON failed_drafts(failure_stage);
+                CREATE INDEX IF NOT EXISTS idx_failed_drafts_skill_id ON failed_drafts(draft_skill_id);
             """)
 
     def _conn(self):
-        """返回 SQLite 连接（使用上下文管理器自动提交/回滚）"""
-        return sqlite3.connect(str(self.db_path))
+        """Return a SQLite connection with WAL mode and a busy timeout.
+
+        WAL mode allows concurrent reads while a write is in progress,
+        preventing 'database is locked' errors in multi-process / multi-thread
+        scenarios.  The 5-second timeout lets writers wait rather than fail
+        immediately on contention.
+        """
+        conn = sqlite3.connect(str(self.db_path), timeout=5.0)
+        # Enable WAL journaling for the connection.
+        # PRAGMA journal_mode is persistent per-database once set, so this is
+        # a no-op on subsequent connections — cheap and safe to call every time.
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
 
     # ------------------------------------------------------------------ #
     #  写入
@@ -162,7 +214,81 @@ class SkillLineage:
                       now, now, extra))
                 return True
 
+    def register_failed_draft(
+        self,
+        *,
+        problem: str,
+        draft: Any,
+        failure_reason: str,
+        failure_stage: str = "quality_evaluation",
+        quality_score: Optional[float] = None,
+        recommendations: Optional[List[str]] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """持久化一次 Layer 3 失败草稿，供 benchmark / audit 复盘。"""
+        if hasattr(draft, "to_dict"):
+            draft_dict = draft.to_dict()
+        else:
+            draft_dict = dict(draft)
+
+        now = datetime.now().isoformat()
+        payload = json.dumps(draft_dict, ensure_ascii=False)
+        recommendation_payload = json.dumps(list(recommendations or []), ensure_ascii=False)
+        extra_payload = json.dumps(extra or {}, ensure_ascii=False)
+
+        with self._conn() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO failed_drafts
+                    (draft_skill_id, draft_name, problem, failure_stage, failure_reason,
+                     quality_score, recommendations, draft_content, extra, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    draft_dict.get("skill_id"),
+                    draft_dict.get("name"),
+                    problem,
+                    failure_stage,
+                    failure_reason,
+                    quality_score,
+                    recommendation_payload,
+                    payload,
+                    extra_payload,
+                    now,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def list_failed_drafts(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """按时间倒序列出最近失败草稿。"""
+        with self._conn() as conn:
+            cursor = conn.execute(
+                """
+                SELECT id, draft_skill_id, draft_name, problem, failure_stage, failure_reason,
+                       quality_score, recommendations, draft_content, extra, created_at
+                FROM failed_drafts
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            rows = cursor.fetchall()
+            columns = [col[0] for col in cursor.description or []]
+
+        results: List[Dict[str, Any]] = []
+        for row in rows:
+            item = dict(zip(columns, row))
+            for field in ("recommendations", "draft_content", "extra"):
+                if item.get(field):
+                    try:
+                        item[field] = json.loads(item[field])
+                    except Exception:
+                        pass
+            results.append(item)
+        return results
+
     def _calc_depth(self, parent_id: Optional[str]) -> int:
+
         """递归计算深度（根节点 = 0）"""
         if parent_id is None:
             return 0
@@ -303,6 +429,7 @@ class SkillLineage:
             avg_quality = conn.execute(
                 "SELECT AVG(quality_score) FROM skill_lineage WHERE quality_score IS NOT NULL"
             ).fetchone()[0]
+            failed_draft_count = conn.execute("SELECT COUNT(*) FROM failed_drafts").fetchone()[0]
 
         return {
             "total_skills": total,
@@ -310,8 +437,10 @@ class SkillLineage:
             "by_status": by_status,
             "max_lineage_depth": max_depth,
             "avg_quality_score": round(avg_quality, 3) if avg_quality else None,
+            "failed_draft_count": failed_draft_count,
             "db_path": str(self.db_path),
         }
+
 
     # ------------------------------------------------------------------ #
     #  工具方法

@@ -1,4 +1,6 @@
 # .gitignore for adaptive-skill-system
+
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -8,13 +10,78 @@ build/
 dist/
 *.egg-info/
 .eggs/
+
+# Virtual environments
 .env
 .venv
 venv/
+
+# Testing
 .pytest_cache/
 .coverage
 htmlcov/
 *.log
 
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Backup files
+*.bak
+*.backup
+
+# Temp files
+*.tmp
+*.temp
+
+# Artifacts
+.benchmark-artifacts/
+.ci-artifacts/
+.pptx-build/
+reports/
+
+# Baselines (regenerated)
+harness_baselines/
+
+# Scripts temp outputs
+scripts/__pycache__/
+scripts/*.json
+scripts/*.txt
+scripts/tmp_*.py
+scripts/_debug_*.py
+
+# Temp fix scripts
+fix_*.py
+test_adapter.py
+test_feedback.py
+test_feedback_methods.py
+test_integration.py
+add_solve_task.py
+push_to_github.py
+probe_*.py
+smoke_*.py
+
+# Debug outputs
+*.txt
+
 # Personal experience log (use EXPERIENCE.template.md instead)
 EXPERIENCE.md
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build artifacts
+.benchmark-artifacts/
+.ci-artifacts/
+.pptx-build/
+.pytest_cache/
+__pycache__/
+*.pyc
+.benchmarks/
+.pprof/
+
+# Reports (generated)
+reports/

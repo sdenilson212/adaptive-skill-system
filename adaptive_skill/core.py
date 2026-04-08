@@ -7,6 +7,16 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 import json
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+# Adapter main path imports
+from .adapters import create_kb_adapter, KBProvider, KBCredential
+from .multi_tenant.context import TenantIsolation, TenantContext
+from .thresholds import DEFAULT_THRESHOLD_POLICY, RuntimeThresholdPolicy
+
 
 
 class SkillStatus(Enum):
@@ -459,7 +469,18 @@ class SkillExecutor:
 class AdaptiveSkillSystem:
     """自适应 Skill 系统的核心类"""
     
-    def __init__(self, kb_client=None, ltm_client=None, memory_dir=None):
+    def __init__(self, 
+                 kb_client=None, 
+                 ltm_client=None, 
+                 memory_dir=None,
+                 feedback_collector=None,
+                 kb_provider: Optional[KBProvider] = None,
+                 kb_credential: Optional[KBCredential] = None,
+                 ltm_provider: Optional[KBProvider] = None,
+                 ltm_credential: Optional[KBCredential] = None,
+                 auto_attach_memory=None,
+                 threshold_policy: RuntimeThresholdPolicy = DEFAULT_THRESHOLD_POLICY):
+
         """
         初始化系统
         
@@ -490,22 +511,58 @@ class AdaptiveSkillSystem:
                 logger.warning(f"自动检测记忆目录失败: {e}")
                 memory_dir = None
         
-        # 创建记忆客户端
-        if memory_dir:
+        # Adapter main path: provider config -> create_kb_adapter() -> runtime
+        # MemorySystemClient is now a compatibility layer
+        raw_kb = None
+        raw_ltm = None
+        self.memory_client = None
+        
+        # Priority 1: Explicit provider config (main path)
+        if kb_provider:
+            raw_kb = create_kb_adapter(kb_provider, kb_credential)
+        if ltm_provider:
+            raw_ltm = create_kb_adapter(ltm_provider, ltm_credential)
+        
+        # Priority 2: Legacy memory_dir path (compatibility)
+        if raw_kb is None and raw_ltm is None and memory_dir:
             from .memory_system_client import MemorySystemClient
             self.memory_client = MemorySystemClient(memory_dir)
-            self.kb = self.memory_client.kb
-            self.ltm = self.memory_client.ltm
+            raw_kb = self.memory_client.kb
+            raw_ltm = self.memory_client.ltm
+        
+        # Priority 3: Direct client injection (testing/compatibility)
+        if raw_kb is None:
+            raw_kb = kb_client
+        if raw_ltm is None:
+            raw_ltm = ltm_client
+        
+        # Wrap with TenantIsolation for automatic tenant filtering.
+        # IMPORTANT: KB and LTM must be separate TenantIsolation instances so that
+        # operations on one store cannot bleed into the other.  Previously both
+        # self.kb and self.ltm pointed at the same object which made KB/LTM
+        # isolation purely nominal.
+        if raw_kb is not None:
+            self._kb_isolation = TenantIsolation(kb_adapter=raw_kb, ltm_adapter=None)
+            self.kb = self._kb_isolation
         else:
-            self.memory_client = None
-            self.kb = kb_client
-            self.ltm = ltm_client
+            self._kb_isolation = None
+            self.kb = None
+
+        if raw_ltm is not None:
+            self._ltm_isolation = TenantIsolation(kb_adapter=None, ltm_adapter=raw_ltm)
+            self.ltm = self._ltm_isolation
+        else:
+            self._ltm_isolation = None
+            self.ltm = None
         
         self.executor = SkillExecutor()
-        self.skills_cache = {}  # 本地 Skill 缓存
+        self.skills_cache = {}
         self.skill_composer = None
         self.skill_generator = None
         self.quality_evaluator = None
+        self.feedback_collector = feedback_collector
+        self.threshold_policy = threshold_policy
+
 
         # 版本 DAG 谱系库（2026-03-29 接入）
         try:
@@ -524,9 +581,17 @@ class AdaptiveSkillSystem:
             from .generator import SkillGenerator
             from .evaluator import QualityEvaluator
             
-            self.skill_composer = SkillComposer(ltm_client=self.ltm, kb_client=self.kb)
-            self.skill_generator = SkillGenerator(ltm_client=self.ltm)
-            self.quality_evaluator = QualityEvaluator()
+            self.skill_composer = SkillComposer(
+                ltm_client=self.ltm,
+                kb_client=self.kb,
+                threshold_policy=self.threshold_policy,
+            )
+            self.skill_generator = SkillGenerator(
+                ltm_client=self.ltm,
+                threshold_policy=self.threshold_policy,
+            )
+            self.quality_evaluator = QualityEvaluator(threshold_policy=self.threshold_policy)
+
             
             # 注：SkillGenerator 预期有 set_composer 方法用于组合，但当前版本尚未实现
             # 暂时注释掉这个连接
@@ -534,59 +599,169 @@ class AdaptiveSkillSystem:
         except ImportError as e:
             print(f"警告：无法加载子模块，部分功能不可用：{e}")
     
-    def solve(self, problem: str, verbose: bool = False) -> SolveResponse:
+    def solve(self, problem: str, verbose: bool = False,
+              tenant_id: Optional[str] = None,
+              user_id: Optional[str] = None,
+              role: Optional[str] = None) -> SolveResponse:
         """
         主入口：尝试解决用户的问题
         
         Args:
             problem: 用户的问题
             verbose: 是否输出详细信息
+            tenant_id: 租户 ID（多租户场景）
+            user_id: 用户 ID
+            role: 用户角色
         
         Returns:
             SolveResponse: 完整的解决方案响应
         """
-        import time
-        start_time = time.time()
+        from .multi_tenant.context import TenantContext
         
+        # Use tenant context if provided
+        if tenant_id:
+            with TenantContext.use(tenant_id, user_id=user_id, role=role):
+                return self._solve_impl(problem, verbose)
+        return self._solve_impl(problem, verbose)
+    
+    def _solve_impl(self, problem: str, verbose: bool = False) -> SolveResponse:
+        """Internal solve implementation."""
+        import time
+        import inspect
+        from .errors import Layer2CoverageError, AdaptiveSkillError
+        start_time = time.time()
+        # decision_trace accumulates structured evidence from each layer.
+        # Each entry is a dict with at minimum {"layer": int, "outcome": str, ...}.
+        decision_trace: list = []
+
+        # ── compatibility helpers ──────────────────────────────────────────
+        # Tests (and legacy callers) may monkeypatch _try_layer_N with plain
+        # lambda problem: ... that only accept a positional 'problem' arg.
+        # We detect whether the bound method/callable accepts a 'trace' kwarg
+        # and fall back gracefully when it doesn't.
+
+        def _call_l1(p: str):
+            fn = self._try_layer_1
+            try:
+                sig = inspect.signature(fn)
+                if "trace" in sig.parameters:
+                    return fn(p, trace=decision_trace)
+            except (ValueError, TypeError):
+                pass
+            return fn(p)
+
+        def _call_l2(p: str):
+            fn = self._try_layer_2
+            try:
+                sig = inspect.signature(fn)
+                if "trace" in sig.parameters:
+                    return fn(p, trace=decision_trace)
+            except (ValueError, TypeError):
+                pass
+            return fn(p)
+
+        def _call_l3(p: str):
+            fn = self._try_layer_3
+            try:
+                sig = inspect.signature(fn)
+                if "trace" in sig.parameters:
+                    return fn(p, trace=decision_trace)
+            except (ValueError, TypeError):
+                pass
+            return fn(p)
+        # ──────────────────────────────────────────────────────────────────
+
         # 第一层：直接调用
         if verbose:
             print("[Layer 1] 搜索已有 Skill...")
-        result_1, skill_1 = self._try_layer_1(problem)
+        result_1, skill_1 = _call_l1(problem)
         if result_1:
             return SolveResponse(
                 result=result_1.output,
                 skill_used=skill_1,
                 layer=1,
                 status="success",
-                confidence=0.95,
+                confidence=self.threshold_policy.layer1_success_confidence,
                 execution_time_ms=(time.time() - start_time) * 1000,
-                metadata={"layer_1_direct_match": True}
+                metadata={"layer_1_direct_match": True, "decision_trace": decision_trace}
             )
-        
-        # 第二层：组合
+
+
+        # 第二层：组合（捕获 Layer2CoverageError 并记录，然后升级到 Layer 3）
         if verbose:
             print("[Layer 2] 尝试从记忆中组合 Skill...")
-        result_2, skill_2 = self._try_layer_2(problem)
-        if result_2:
-            return SolveResponse(
-                result=result_2.output,
-                skill_used=skill_2,
-                layer=2,
-                status="success",
-                confidence=0.80,
-                execution_time_ms=(time.time() - start_time) * 1000,
-                metadata={"layer_2_composed": True}
-            )
-        
+        layer_2_block_info: dict | None = None
+        try:
+            result_2, skill_2 = _call_l2(problem)
+            if result_2:
+                return SolveResponse(
+                    result=result_2.output,
+                    skill_used=skill_2,
+                    layer=2,
+                    status="success",
+                    confidence=self.threshold_policy.layer2_success_confidence,
+                    execution_time_ms=(time.time() - start_time) * 1000,
+                    metadata={"layer_2_composed": True, "decision_trace": decision_trace}
+                )
+
+        except Layer2CoverageError as exc:
+            layer_2_block_info = {
+                "error_type": type(exc).__name__,
+                "actual_coverage": exc.actual_coverage,
+                "minimum_coverage": exc.minimum_coverage,
+                "framework_step_count": exc.framework_step_count,
+                "ltm_supported_count": exc.ltm_supported_count,
+                "message": str(exc),
+            }
+            if verbose:
+                print(f"[Layer 2] 覆盖率不足 ({exc.actual_coverage:.1%} < {exc.minimum_coverage:.1%})，升级到 Layer 3")
+        except AdaptiveSkillError as exc:
+            layer_2_block_info = {
+                "error_type": type(exc).__name__,
+                "message": str(exc),
+            }
+            if verbose:
+                print(f"[Layer 2] 失败 ({type(exc).__name__})，升级到 Layer 3")
+
         # 第三层：自动生成
         if verbose:
             print("[Layer 3] 尝试自动生成 Skill...")
-        result_3, skill_3, gen_info = self._try_layer_3(problem)
+        gen_info: dict | None = None
+        try:
+            result_3, skill_3, gen_info = _call_l3(problem)
+        except Exception as exc:
+            # Layer3QualityGateError 或其他异常 → 静默，记录 gen_info，走 failed 路径
+            from .errors import Layer3QualityGateError
+            if isinstance(exc, Layer3QualityGateError):
+                gen_info = {
+                    "quality": getattr(exc, "confidence", 0.0),
+                    "blocked_reason": "quality gate",
+                    "blocked_stage": "draft_generation",
+                    "generation_mode": "blocked_before_draft",
+                    "error_message": str(exc),
+                }
+            else:
+                gen_info = {
+                    "blocked_reason": type(exc).__name__,
+                    "blocked_stage": "layer_3_execution",
+                    "error_message": str(exc),
+                }
+            if verbose:
+                print(f"[Layer 3] 被 {type(exc).__name__} 拦截，走 failed 路径")
+            result_3, skill_3 = None, None
         if result_3:
             quality_score = gen_info.get("quality", 0)
-            status = "success" if quality_score >= 0.75 else "partial"
+            status = self.threshold_policy.layer3_status_for_quality(quality_score)
             confidence = quality_score
-            
+            meta: dict = {
+                "layer_3_auto_generated": True,
+                "generation_quality": quality_score,
+                "needs_feedback": self.threshold_policy.layer3_needs_feedback(quality_score),
+                "decision_trace": decision_trace,
+            }
+
+            if layer_2_block_info:
+                meta["layer_2_block"] = layer_2_block_info
             return SolveResponse(
                 result=result_3.output,
                 skill_used=skill_3,
@@ -594,14 +769,18 @@ class AdaptiveSkillSystem:
                 status=status,
                 confidence=confidence,
                 execution_time_ms=(time.time() - start_time) * 1000,
-                metadata={
-                    "layer_3_auto_generated": True,
-                    "generation_quality": quality_score,
-                    "needs_feedback": quality_score < 0.85
-                }
+                metadata=meta,
             )
-        
-        # 都失败了
+
+        # Layer 3 也未产出结果（可能是 quality gate 拦截）
+        meta_failed: dict = {
+            "reason": "Cannot solve this problem with current skills",
+            "decision_trace": decision_trace,
+        }
+        if layer_2_block_info:
+            meta_failed["layer_2_block"] = layer_2_block_info
+        if gen_info:
+            meta_failed["layer_3_attempt"] = gen_info
         return SolveResponse(
             result=None,
             skill_used=None,
@@ -609,17 +788,19 @@ class AdaptiveSkillSystem:
             status="failed",
             confidence=0.0,
             execution_time_ms=(time.time() - start_time) * 1000,
-            metadata={"reason": "Cannot solve this problem with current skills"}
+            metadata=meta_failed,
         )
     
-    def _try_layer_1(self, problem: str) -> Tuple[Optional[ExecutionResult], Optional[Skill]]:
+    def _try_layer_1(self, problem: str,
+                     trace: Optional[list] = None) -> Tuple[Optional[ExecutionResult], Optional[Skill]]:
         """
         第一层：在 KB 中搜索已有 Skill，若置信度足够则直接执行。
         
         匹配逻辑：
         1. 先从本地缓存（skills_cache）中查找
         2. 若有 KB 客户端，搜索 KB
-        3. 计算关键词覆盖率作为置信度，阈值 0.60 触发执行
+        3. 计算关键词覆盖率作为置信度，阈值由共享 threshold policy 决定
+
         """
         # 1. 提取问题关键词（中文用字符 2-gram，英文按空格）
         problem_lower = problem.lower()
@@ -657,13 +838,41 @@ class AdaptiveSkillSystem:
                 best_score = score
                 best_skill = skill
         
-        # 3. 若有 KB 客户端，从知识库搜索
+        # 3. 若有 KB 客户端，从知识库搜索（支持 QueryVariant 多路召回）
         if self.kb:
             try:
-                kb_results = self.kb.search(query=problem, top_k=5)
-                for entry in (kb_results or []):
+                # 3a. 尝试用 retrieval 模块生成 query variants 做多路召回
+                all_kb_entries: list = []
+                seen_ids: set = set()
+
+                def _dedup_add(entries):
+                    for e in (entries or []):
+                        e_id = (e.get("id") or e.get("doc_id") or id(e)) if isinstance(e, dict) else id(e)
+                        if e_id not in seen_ids:
+                            seen_ids.add(e_id)
+                            all_kb_entries.append(e)
+
+                # 主路：原始 query
+                _dedup_add(self.kb.search(query=problem, top_k=5))
+
+                # 多路：query variants（使用 retrieval 模块，失败则静默跳过）
+                try:
+                    from .retrieval import build_query_variants
+                    variants = build_query_variants(problem)
+                    for variant in variants:
+                        variant_query = getattr(variant, "query", None) or str(variant)
+                        if variant_query and variant_query != problem:
+                            try:
+                                _dedup_add(self.kb.search(query=variant_query, top_k=5))
+                            except Exception:
+                                pass
+                except Exception:
+                    pass  # retrieval 模块不可用时降级到单路召回
+
+                for entry in all_kb_entries:
                     # KB 条目可能是 dict（kb_search 返回）
                     entry_dict = entry if isinstance(entry, dict) else (entry.to_dict() if hasattr(entry, 'to_dict') else {})
+
                     
                     # 尝试从 KB 条目重建 Skill
                     skill_data = entry_dict.get("content_parsed") or entry_dict.get("extra", {})
@@ -677,41 +886,133 @@ class AdaptiveSkillSystem:
                         except Exception:
                             pass
                     
-                    # 若 KB 条目不是 Skill 对象，看标签/标题匹配度
-                    title = entry_dict.get("title", "").lower()
-                    tags = " ".join(entry_dict.get("tags", [])).lower()
-                    combined = f"{title} {tags} {entry_dict.get('content','')[:200]}".lower()
-                    overlap = sum(1 for kw in keywords if kw in combined)
-                    kw_score = overlap / max(len(keywords), 1)
-                    if kw_score > best_score:
-                        best_score = kw_score
-                        # 用 KB 条目构造一个轻量 Skill 壳（供执行器路由）
+                    # 若 KB 条目不是 Skill 对象，使用质量评估机制
+                    quality_score, quality_level = self._evaluate_kb_match_quality(entry_dict, problem, keywords)
+                    
+                    # 只有高质量匹配才更新 best_score
+                    # 中等质量匹配需要额外验证（暂时跳过，让 L2/L3 处理）
+                    if quality_level == "high" and quality_score > best_score:
+                        best_score = quality_score
                         best_skill = self._skill_from_kb_entry(entry_dict)
+                    elif quality_level == "medium" and quality_score > best_score:
+                        # 中等质量：记录但不立即使用，给 L2/L3 机会
+                        # 如果后续没有更好的匹配，可以考虑使用
+                        pass  # 暂时跳过中等质量匹配
             except Exception as e:
                 import logging
                 logging.getLogger(__name__).debug(f"Layer 1 KB 搜索失败: {e}")
         
-        # 4. 阈值判断（中文分词粒度较粗，阈值 0.40 更合理）
-        LAYER1_THRESHOLD = 0.40
-        if best_skill and best_score >= LAYER1_THRESHOLD:
+        # 4. 阈值判断：统一走共享 threshold policy，避免 core 与 thresholds.py 分叉
+        layer1_threshold = self.threshold_policy.layer1_direct_match_threshold
+        if best_skill and best_score >= layer1_threshold:
+            if trace is not None:
+                trace.append({
+                    "layer": 1,
+                    "outcome": "hit",
+                    "skill_id": best_skill.skill_id,
+                    "skill_name": best_skill.name,
+                    "score": round(best_score, 4),
+                    "threshold": layer1_threshold,
+                    "reason": f"score {best_score:.4f} >= threshold {layer1_threshold}",
+                })
             # 缓存命中的 Skill
             self.skills_cache[best_skill.skill_id] = best_skill
             # 写入谱系库（原创/已有 Skill 的使用记录）
-            if self.lineage:
-                try:
-                    self.lineage.register(best_skill)
-                except Exception:
-                    pass
+            self._register_lineage_skill(best_skill, stage="layer_1_match")
             result = self.executor.execute(best_skill, problem)
             return result, best_skill
-        
+
+        if trace is not None:
+            trace.append({
+                "layer": 1,
+                "outcome": "miss",
+                "best_skill_id": best_skill.skill_id if best_skill else None,
+                "best_skill_name": best_skill.name if best_skill else None,
+                "best_score": round(best_score, 4),
+                "threshold": layer1_threshold,
+                "reason": (
+                    f"score {best_score:.4f} < threshold {layer1_threshold}"
+                    if best_skill else "no skill found in KB or cache"
+                ),
+            })
         return None, None
     
     def _compute_skill_relevance(self, skill: Skill, keywords: List[str], problem_lower: str) -> float:
-        """计算 Skill 与问题的关联分数（0-1）"""
+        """计算 Skill 与问题的关联分数（0-1），区分匹配质量等级
+        
+        改进：只使用核心关键词（长度>=2）计算分数，避免单字词误匹配
+        """
         skill_text = f"{skill.name} {skill.description} {' '.join(skill.required_inputs)} {' '.join(skill.outputs)}".lower()
-        overlap = sum(1 for kw in keywords if kw in skill_text)
-        return overlap / max(len(keywords), 1)
+        
+        # 只使用核心关键词（长度>=2）
+        core_keywords = [kw for kw in keywords if len(kw) >= 2]
+        if not core_keywords:
+            return 0.0
+        
+        # 基础分数：核心关键词覆盖率
+        overlap = sum(1 for kw in core_keywords if kw in skill_text)
+        base_score = overlap / max(len(core_keywords), 1)
+        
+        # 质量加成：检查核心意图匹配度
+        name_lower = skill.name.lower() if skill.name else ""
+        desc_lower = skill.description.lower() if skill.description else ""
+        
+        # 计算核心关键词在 name 中的命中数（权重更高）
+        name_hits = sum(1 for kw in core_keywords if kw in name_lower)
+        desc_hits = sum(1 for kw in core_keywords if kw in desc_lower)
+        
+        # 核心关键词命中加成
+        core_bonus = 0.0
+        if name_hits > 0:
+            core_bonus += 0.15 * (name_hits / len(core_keywords))
+        if desc_hits > 0:
+            core_bonus += 0.10 * (desc_hits / len(core_keywords))
+        
+        # 如果核心关键词全部未命中 name，惩罚分数
+        if core_keywords and name_hits == 0:
+            penalty = 0.30 * base_score  # 增加惩罚力度
+            base_score = max(0, base_score - penalty)
+        
+        return min(1.0, base_score + core_bonus)
+    
+    def _evaluate_kb_match_quality(self, entry: Dict, problem: str, keywords: List[str]) -> Tuple[float, str]:
+        """
+        评估 KB 条目匹配质量，返回 (调整后分数, 质量等级)
+        
+        关键区分：
+        - L1 case：问题关键词与 KB title 高度匹配
+        - L2 case：问题关键词与 KB tags 重叠，但 title 不匹配
+        
+        解决方案：只有 title 匹配才能获得高分
+        """
+        title = entry.get("title", "").lower()
+        tags = " ".join(entry.get("tags", [])).lower()
+        
+        # 提取问题核心意图词（长度>=2的关键词）
+        core_keywords = [kw for kw in keywords if len(kw) >= 2]
+        if not core_keywords:
+            return 0.0, "low"
+        
+        # 计算 title 命中率（核心判断）
+        title_hits = sum(1 for kw in core_keywords if kw in title)
+        title_ratio = title_hits / len(core_keywords)
+        
+        # 计算 tags 命中率
+        tag_hits = sum(1 for kw in core_keywords if kw in tags)
+        tag_ratio = tag_hits / len(core_keywords)
+        
+        # 质量判断：只有 title 匹配才能作为 L1
+        if title_ratio >= 0.2:
+            # title 匹配：高质量
+            return 0.45, "high"
+        
+        # title 不匹配但 tags 匹配：这是 L2 case 的特征
+        if tag_ratio >= 0.2:
+            # 降低分数，使其低于 L1 阈值 0.35
+            return 0.25, "medium"
+        
+        # title 和 tags 都不匹配：低质量
+        return 0.15, "low"
     
     def _skill_from_kb_entry(self, entry: Dict) -> "Skill":
         """将 KB 条目包装成轻量 Skill，用于 Layer 1 执行"""
@@ -748,12 +1049,29 @@ class AdaptiveSkillSystem:
             ),
             generation_info=GenerationInfo(
                 skill_type=SkillType.MANUAL,
-                confidence=0.75
+                confidence=self.threshold_policy.manual_skill_default_confidence
             ),
+
             quality_metrics=QualityMetrics()
         )
     
-    def _try_layer_2(self, problem: str) -> Tuple[Optional[ExecutionResult], Optional[Skill]]:
+    def _register_lineage_skill(self, skill: "Skill", stage: str = "unknown") -> None:
+        """写入谱系库；注册失败时记 WARNING 并静默继续，不中断主流程。"""
+        import logging
+        if not self.lineage:
+            return
+        try:
+            self.lineage.register(skill)
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "SkillLineage register 失败 [stage=%s, skill=%s]: %s",
+                stage,
+                getattr(skill, "skill_id", skill),
+                exc,
+            )
+
+    def _try_layer_2(self, problem: str,
+                     trace: Optional[list] = None) -> Tuple[Optional[ExecutionResult], Optional[Skill]]:
         """第二层：从记忆中组合"""
         try:
             from .composer import SkillComposer
@@ -767,7 +1085,12 @@ class AdaptiveSkillSystem:
             spec.loader.exec_module(mod)
             SkillComposer = mod.SkillComposer
         
-        composer = SkillComposer(ltm_client=self.ltm, kb_client=self.kb)
+        composer = SkillComposer(
+            ltm_client=self.ltm,
+            kb_client=self.kb,
+            threshold_policy=self.threshold_policy,
+        )
+
         
         # 分析问题
         problem_analysis = composer.analyze_problem(problem)
@@ -779,10 +1102,45 @@ class AdaptiveSkillSystem:
         # 评估是否能组合
         can_compose, assessment = composer.assess_composability(ltm_results, problem)
         if not can_compose:
+            if trace is not None:
+                trace.append({
+                    "layer": 2,
+                    "outcome": "miss",
+                    "ltm_results_count": len(ltm_results) if ltm_results else 0,
+                    "keywords": keywords,
+                    "can_compose": False,
+                    "assessment_summary": str(assessment)[:200] if assessment else None,
+                    "reason": "composability check failed",
+                })
             return None, None
         
         # 创建组合计划
         composition_plan = composer.create_composition_plan(problem, ltm_results, problem_analysis)
+
+        if trace is not None:
+            plan_summary = {}
+            if hasattr(composition_plan, "to_dict"):
+                plan_dict = composition_plan.to_dict()
+                plan_summary = {
+                    "framework": plan_dict.get("framework"),
+                    "step_count": len(plan_dict.get("steps", [])),
+                    "ltm_references_count": len(plan_dict.get("ltm_references", [])),
+                }
+            elif isinstance(composition_plan, dict):
+                plan_summary = {
+                    "framework": composition_plan.get("framework"),
+                    "step_count": len(composition_plan.get("steps", [])),
+                    "ltm_references_count": len(composition_plan.get("ltm_references", [])),
+                }
+            trace.append({
+                "layer": 2,
+                "outcome": "hit",
+                "ltm_results_count": len(ltm_results) if ltm_results else 0,
+                "keywords": keywords,
+                "can_compose": True,
+                "composition_plan": plan_summary,
+                "reason": "composability check passed, composition plan created",
+            })
         
         # 根据组合计划创建 Skill
         composed_skill = self._skill_from_composition_plan(composition_plan, problem)
@@ -799,7 +1157,8 @@ class AdaptiveSkillSystem:
         
         return result, composed_skill
     
-    def _try_layer_3(self, problem: str) -> Tuple[Optional[ExecutionResult], Optional[Skill], Optional[Dict]]:
+    def _try_layer_3(self, problem: str,
+                     trace: Optional[list] = None) -> Tuple[Optional[ExecutionResult], Optional[Skill], Optional[Dict]]:
         """第三层：自动生成"""
         try:
             from .generator import SkillGenerator
@@ -817,14 +1176,26 @@ class AdaptiveSkillSystem:
             SkillGenerator = _load("generator").SkillGenerator
             QualityEvaluator = _load("evaluator").QualityEvaluator
         
-        generator = SkillGenerator(ltm_client=self.ltm)
-        evaluator = QualityEvaluator()
+        generator = SkillGenerator(
+            ltm_client=self.ltm,
+            threshold_policy=self.threshold_policy,
+        )
+        evaluator = QualityEvaluator(threshold_policy=self.threshold_policy)
+
         
         # 检查是否能生成
         available_ltm_info = self.ltm.recall(query=problem) if self.ltm else None
         can_gen, gen_feasibility = generator.can_generate(problem, available_ltm_info)
         
         if not can_gen:
+            if trace is not None:
+                trace.append({
+                    "layer": 3,
+                    "outcome": "miss",
+                    "reason": "can_generate returned False",
+                    "feasibility": str(gen_feasibility)[:200] if gen_feasibility else None,
+                    "ltm_available": available_ltm_info is not None,
+                })
             return None, None, None
         
         # 分析生成上下文
@@ -838,15 +1209,50 @@ class AdaptiveSkillSystem:
         
         # 质量评估
         assessment = evaluator.assess_skill_quality(skill_draft.to_dict())
+
+        # 构造维度分数摘要（如果 assessment 暴露了 dimension_scores）
+        dimension_scores: dict = {}
+        if hasattr(assessment, "dimension_scores") and assessment.dimension_scores:
+            dimension_scores = {
+                k: round(float(v), 4) for k, v in assessment.dimension_scores.items()
+            }
+        elif hasattr(assessment, "scores") and assessment.scores:
+            dimension_scores = {
+                k: round(float(v), 4) for k, v in assessment.scores.items()
+            }
         
         # 如果质量不够好，返回部分成功
         if not assessment.is_approved:
+            if trace is not None:
+                trace.append({
+                    "layer": 3,
+                    "outcome": "quality_gate_rejected",
+                    "strategy": strategy.value if hasattr(strategy, "value") else str(strategy),
+                    "overall_score": round(float(assessment.overall_score), 4),
+                    "quality_gate_threshold": self.threshold_policy.layer3_quality_gate_threshold,
+                    "dimension_scores": dimension_scores,
+                    "ltm_results_count": len(available_ltm_info) if available_ltm_info else 0,
+                    "reason": "quality gate rejected draft",
+                })
             return None, None, {
                 "quality": assessment.overall_score,
                 "confidence": assessment.confidence_level,
                 "recommendations": assessment.recommendations
             }
         
+        if trace is not None:
+            trace.append({
+                "layer": 3,
+                "outcome": "hit",
+                "strategy": strategy.value if hasattr(strategy, "value") else str(strategy),
+                "overall_score": round(float(assessment.overall_score), 4),
+                "quality_gate_threshold": self.threshold_policy.layer3_quality_gate_threshold,
+                "dimension_scores": dimension_scores,
+                "ltm_results_count": len(available_ltm_info) if available_ltm_info else 0,
+                "skill_draft_steps": len(skill_draft.steps) if hasattr(skill_draft, "steps") else None,
+                "reason": "quality gate passed, skill generated",
+            })
+
         # 将草稿转换为完整 Skill
         generated_skill = self._skill_from_draft(skill_draft)
         
@@ -868,6 +1274,103 @@ class AdaptiveSkillSystem:
             "generation_info": skill_draft.to_dict()
         }
     
+
+    def solve_task(self, task, context=None, verbose=False, **kwargs):
+        """
+        Protocol-based task solving with tenant context extraction.
+        
+        Args:
+            task: TaskSpec or dict with task information
+            context: Optional ContextSpec
+            verbose: Whether to print verbose output
+            **kwargs: Additional arguments passed to solve_task_with_protocol
+        
+        Returns:
+            ExecutionResult with feedback envelope attached
+        """
+        from .protocols import solve_task_with_protocol, TaskSpec, ContextSpec
+        from .multi_tenant.context import TenantContext
+        
+        # Normalize task to TaskSpec
+        if isinstance(task, dict):
+            task = TaskSpec(**task)
+        
+        # Extract tenant info from task metadata or context
+        tenant_id = kwargs.pop('tenant_id', None)
+        user_id = kwargs.pop('user_id', None)
+        role = kwargs.pop('role', None)
+        
+        if not tenant_id and hasattr(task, 'metadata') and task.metadata:
+            tenant_id = task.metadata.get('tenant_id')
+            user_id = task.metadata.get('user_id')
+            role = task.metadata.get('role')
+        
+        # Use tenant context if available
+        if tenant_id:
+            with TenantContext.use(tenant_id, user_id=user_id, role=role):
+                result = solve_task_with_protocol(self, task, context=context, verbose=verbose, **kwargs)
+        else:
+            result = solve_task_with_protocol(self, task, context=context, verbose=verbose, **kwargs)
+        
+        # Attach feedback envelope
+        result = self._attach_feedback_envelope(result, task, context, tenant_id, user_id)
+        return result
+    
+    def _attach_feedback_envelope(self, result, task, context, tenant_id, user_id):
+        """Attach feedback methods to ExecutionResult."""
+        if not self.feedback_collector:
+            return result
+        
+        result._feedback_collector = self.feedback_collector
+        result._feedback_context = {
+            "task_id": task.task_id if hasattr(task, 'task_id') else None,
+            "skill_id": result.metadata.get("selected_skill", {}).get("id") if hasattr(result, "metadata") and result.metadata else None,
+            "layer_used": result.layer if hasattr(result, "layer") else None,
+            "tenant_id": tenant_id,
+            "user_id": user_id,
+            "session_id": context.session_id if context else None,
+        }
+        
+        def thumbs_up():
+            ctx = result._feedback_context
+            return self.feedback_collector.thumbs_up(
+                task_id=ctx["task_id"],
+                skill_id=ctx["skill_id"],
+                session_id=ctx["session_id"],
+                layer_used=ctx["layer_used"],
+                user_id=ctx["user_id"],
+                tenant_id=ctx["tenant_id"],
+            )
+        
+        def thumbs_down(reason=None):
+            ctx = result._feedback_context
+            return self.feedback_collector.thumbs_down(
+                task_id=ctx["task_id"],
+                skill_id=ctx["skill_id"],
+                session_id=ctx["session_id"],
+                layer_used=ctx["layer_used"],
+                user_id=ctx["user_id"],
+                tenant_id=ctx["tenant_id"],
+                reason=reason,
+            )
+        
+        def rate(rating, comment=None):
+            ctx = result._feedback_context
+            return self.feedback_collector.rate(
+                rating=rating,
+                task_id=ctx["task_id"],
+                skill_id=ctx["skill_id"],
+                session_id=ctx["session_id"],
+                layer_used=ctx["layer_used"],
+                user_id=ctx["user_id"],
+                tenant_id=ctx["tenant_id"],
+                comment=comment,
+            )
+        
+        result.feedback_thumbs_up = thumbs_up
+        result.feedback_thumbs_down = thumbs_down
+        result.feedback_rate = rate
+        return result
     def update_skill_from_feedback(self, skill_id: str, feedback: str) -> Skill:
         """
         根据用户反馈更新 Skill
@@ -912,13 +1415,17 @@ class AdaptiveSkillSystem:
             except Exception:
                 pass
         
-        # 记录到 LTM
-        if self.ltm:
-            self.ltm.save({
-                "content": f"Skill '{skill.name}' updated: {feedback}",
-                "category": "project",
-                "tags": ["skill-update", skill_id]
-            })
+        # 记录到 LTM（通过 _ltm_raw 直接调用，避免 TenantIsolation proxy 走 KB 路径）
+        ltm_raw = getattr(self.ltm, "_ltm", None) or (self.ltm if not hasattr(self.ltm, "_ltm") else None)
+        if ltm_raw:
+            try:
+                ltm_raw.save({
+                    "content": f"Skill '{skill.name}' updated: {feedback}",
+                    "category": "project",
+                    "tags": ["skill-update", skill_id]
+                })
+            except Exception:
+                pass
         
         return updated_skill
     
@@ -1044,8 +1551,11 @@ class AdaptiveSkillSystem:
                 skill_type=SkillType.COMPOSED,
                 ltm_references=[c.get("source") for c in composition_plan.components if c["source"] != "framework"],
                 confidence=composition_plan.estimated_quality,
-                needs_verification=composition_plan.estimated_quality < 0.80
+                needs_verification=self.threshold_policy.layer2_composed_needs_verification(
+                    composition_plan.estimated_quality
+                )
             ),
+
             quality_metrics=QualityMetrics()
         )
         

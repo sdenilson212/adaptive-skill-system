@@ -4,7 +4,8 @@
 
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![Tests](https://img.shields.io/badge/tests-23%20passed-brightgreen.svg)](#tests)
+[![Tests](https://img.shields.io/badge/tests-394%20passed-brightgreen.svg)](#运行测试)
+
 
 [English](#english) | 中文
 
@@ -111,9 +112,32 @@ result2 = system.solve(
 # 系统会自动将修改后的方案保存到 KB，下次更快更准
 ```
 
+### Harness Reporting CLI
+
+安装为可编辑包后，可以直接把持久化的 `BatchResult.to_dict()` JSON 转成 P4 报告：
+
+```bash
+adaptive-skill-report path/to/batch-result.json --output-dir reports
+```
+
+如果已经锁定 baseline，还可以顺手做 regression check：
+
+```bash
+adaptive-skill-report path/to/batch-result.json \
+  --baseline harness_baselines/v1.0.0.json \
+  --output-dir reports \
+  --fail-on-regression
+```
+
+产出物：
+- `*.json`：结构化报告 payload
+- `*.md`：适合 review / CI artifact 的文本报告
+- `*.html`：可直接打开浏览的可视化报告
+
 ---
 
 ## 四种生成策略（Layer 3）
+
 
 | 策略 | 适用场景 | 说明 |
 |------|---------|------|
@@ -146,17 +170,110 @@ result2 = system.solve(
 
 ```bash
 cd adaptive-skill-system
-python -m pytest tests/ -v
+python -m pytest tests -q
 ```
 
-期望输出：
+当前主线期望输出：
 ```
-23 passed in 0.16s
+353 passed
 ```
+
+### GitHub Actions CI
+
+仓库现在自带 `.github/workflows/ci.yml`，默认会在 push / pull request / workflow_dispatch 时执行四段链路：
+
+1. `python -m pytest tests -q` —— 真实代码主线门禁
+2. `python scripts/run_harness_ci_suite.py` —— 生成确定性的 harness smoke batch + metrics
+3. `python scripts/run_harness_real_benchmark.py --baseline harness_baselines/real-benchmark-v2.json` —— 生成真实 solver 的 seeded benchmark artifact，并附带 advisory regression 结果
+4. `adaptive-skill-report ... --baseline harness_baselines/ci-smoke-v1.json --fail-on-regression` —— 产出 JSON / Markdown / HTML 报告，并在 smoke baseline 回归时让 CI 直接失败
+
+CI artifact 会上传到 `.ci-artifacts/`，其中包含：
+- `pytest.xml`
+- `harness/harness-batch-result.json`
+- `harness/harness-metrics.json`
+- `reports/adaptive-skill-harness-ci.{json,md,html}`
+- `real-benchmark/real-benchmark-batch-result.json`
+- `real-benchmark/real-benchmark-metrics.json`
+- `real-benchmark/reports/adaptive-skill-harness-real-benchmark.{json,md,html}`
+
+说明：
+- smoke batch 仍然是唯一强 gate，用来稳定覆盖 reporting / baseline / regression 主链路
+- seeded real benchmark 现在也会随 CI 一起产出，但当前只作为观察真实 solver 表现的 artifact，不直接卡 workflow
+- 真正的仓库代码正确性仍以 `pytest tests -q` 为准
+
+### Seeded Real Benchmark
+
+除了 CI smoke suite，仓库现在还提供一条面向真实 solver 的 seeded benchmark 链路：
+
+```bash
+python scripts/run_harness_real_benchmark.py \
+  --output-dir .benchmark-artifacts/real-benchmark \
+  --baseline-out harness_baselines/real-benchmark-v2.json
+```
+
+这条链路的特点：
+- 跑的是真实 `AdaptiveSkillSystem.solve()`，不是合成结果
+- KB/LTM 使用内存 seed，不依赖开发机本地 memory bank
+- 固定覆盖 6 个代表性 case：Layer 1 × 1、Layer 2 × 2、Layer 3 × 3
+- 新增覆盖面包括：Layer 2 多源组合边界、Layer 3 稀疏上下文、Layer 3 list-shaped recall 回归保护
+- 会同时产出 `BatchResult`、`Metrics`、JSON/Markdown/HTML 报告，以及可提交的 baseline
+
+当前基线：`harness_baselines/real-benchmark-v2.json`
+
+本地做 regression check：
+
+```bash
+python scripts/run_harness_real_benchmark.py \
+  --output-dir .benchmark-artifacts/real-benchmark-check \
+  --baseline harness_baselines/real-benchmark-v2.json \
+  --fail-on-regression
+```
+
+说明：real benchmark 默认把 `p95_latency_increase_pct` 放宽到 `200%`，因为这条链路的单次耗时只有几毫秒，机器抖动很容易把默认 `50%` 阈值打穿；这里更关注 solver 行为回归，而不是微小的本地延迟波动。
+
+当前 benchmark v2 基线表现：
+- `pass_rate = 1.0000`
+- `avg_score = 0.8417`
+- `layer_distribution = {1:1, 2:2, 3:3}`
+
+### Release Claim Gate（对外口径）
+
+如果要更新 README、release note、里程碑总结或任何对外 capability claim，当前统一先跑：
+
+```bash
+python scripts/run_release_claim_gate.py \
+  --output-dir .benchmark-artifacts/release-claim-gate \
+  --include-real-benchmark
+```
+
+这条收口命令会固定执行：
+1. `pytest tests -q --tb=short`
+2. `ci-smoke-v1` batch + regression report
+3. `claim-benchmark-v2` release gate（当前正式对外证据）
+4. `real-benchmark-v2` advisory diagnostics（可选观察项，不直接阻断 claim）
+
+当前对外口径约定：
+- 只有 `release-claim-gate-summary` 的 `overall_verdict` 为 `PASS` 或 `PASS_WITH_ADVISORY`，才允许更新 README / release note / 外部说明。
+- `claim-benchmark-v2`（36-case seeded suite）是当前唯一的 release-grade evidence source。
+- `claim-benchmark-v1` 已冻结，只保留历史对照职责，不再作为默认对外 claim 口径。
+
+当前可引用的 v2 证据口径：
+- `claim-benchmark-v2`: `36/36` passed
+- `pass_rate = 1.0000`
+- `avg_score = 0.9333`
+- Wilson 95% CI lower bound = `0.9036`
+- 旧口径 `claim-benchmark-v1`: `18/18` passed，仅保留为历史对照，不再代表当前默认 claim
+
+更完整的 benchmark 治理说明见：`docs/BENCHMARK_GOVERNANCE.md`
+
 
 ---
 
+
 ## 项目结构
+
+
+
 
 ```
 adaptive-skill-system/
@@ -170,8 +287,10 @@ adaptive-skill-system/
 │   └── test_core.py      # 23个单元测试
 ├── docs/
 │   ├── ARCHITECTURE.md   # 完整架构设计（2000+行）
+│   ├── BENCHMARK_GOVERNANCE.md
 │   ├── IMPLEMENTATION_GUIDE.md
 │   └── DEEPENING_SUMMARY.md
+
 ├── README.md
 ├── requirements.txt
 └── setup.py

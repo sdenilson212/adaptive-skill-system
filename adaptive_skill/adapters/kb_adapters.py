@@ -202,6 +202,55 @@ class BaseKBAdapter(ABC):
     def health_check(self) -> bool:
         return self._is_healthy
 
+    def _matches_query(self, doc: KBDocument, query: str) -> bool:
+        """检查文档是否命中查询。"""
+        if not query:
+            return True
+        query_lower = query.lower()
+        return query_lower in doc.title.lower() or query_lower in doc.content.lower()
+
+    def _matches_filter_value(self, actual: Any, expected: Any) -> bool:
+        """检查单个过滤条件是否匹配。"""
+        if isinstance(actual, (list, tuple, set)):
+            if isinstance(expected, (list, tuple, set)):
+                return all(item in actual for item in expected)
+            return expected in actual
+        return actual == expected
+
+    def _matches_filters(self, doc: KBDocument, filters: Optional[Dict[str, Any]]) -> bool:
+        """检查文档是否满足过滤条件。"""
+        if not filters:
+            return True
+
+        for key, expected in filters.items():
+            actual = doc.metadata.get(key)
+            if actual is None and hasattr(doc, key):
+                actual = getattr(doc, key)
+            if not self._matches_filter_value(actual, expected):
+                return False
+        return True
+
+    def _search_cache(
+        self,
+        query: str,
+        top_k: int = 5,
+        filters: Optional[Dict[str, Any]] = None,
+    ) -> List[KBDocument]:
+        """在本地缓存中执行统一查询与过滤。"""
+        if top_k <= 0:
+            return []
+
+        results: List[KBDocument] = []
+        for doc in self._cache.values():
+            if not self._matches_query(doc, query):
+                continue
+            if not self._matches_filters(doc, filters):
+                continue
+            results.append(doc)
+            if len(results) >= top_k:
+                break
+        return results
+
 
 # ---------------------------------------------------------------------------
 # 飞书适配器
@@ -271,17 +320,7 @@ class FeishuKBAdapter(BaseKBAdapter):
         try:
             # 调用飞书搜索 API
             # 实际实现需要调用 lark.api.wiki.search
-            results = []
-            
-            # 简化实现：返回缓存中的匹配文档
-            query_lower = query.lower()
-            for doc in self._cache.values():
-                if query_lower in doc.title.lower() or query_lower in doc.content.lower():
-                    results.append(doc)
-                    if len(results) >= top_k:
-                        break
-            
-            return results
+            return self._search_cache(query, top_k, filters)
         except Exception as e:
             self._log_error("search", e)
             return []
@@ -391,15 +430,7 @@ class ConfluenceKBAdapter(BaseKBAdapter):
             return []
         
         try:
-            # 简化实现：返回缓存中的匹配文档
-            results = []
-            query_lower = query.lower()
-            for doc in self._cache.values():
-                if query_lower in doc.title.lower() or query_lower in doc.content.lower():
-                    results.append(doc)
-                    if len(results) >= top_k:
-                        break
-            return results
+            return self._search_cache(query, top_k, filters)
         except Exception as e:
             self._log_error("search", e)
             return []
@@ -496,16 +527,7 @@ class NotionKBAdapter(BaseKBAdapter):
         try:
             # 调用 Notion 搜索 API
             # response = self._session.post(f"{self._base_url}/search", json={"query": query})
-            
-            # 简化实现：返回缓存中的匹配文档
-            results = []
-            query_lower = query.lower()
-            for doc in self._cache.values():
-                if query_lower in doc.title.lower() or query_lower in doc.content.lower():
-                    results.append(doc)
-                    if len(results) >= top_k:
-                        break
-            return results
+            return self._search_cache(query, top_k, filters)
         except Exception as e:
             self._log_error("search", e)
             return []
@@ -599,15 +621,7 @@ class GenericKBAdapter(BaseKBAdapter):
             return []
         
         try:
-            # 简化实现：返回缓存中的匹配文档
-            results = []
-            query_lower = query.lower()
-            for doc in self._cache.values():
-                if query_lower in doc.title.lower() or query_lower in doc.content.lower():
-                    results.append(doc)
-                    if len(results) >= top_k:
-                        break
-            return results
+            return self._search_cache(query, top_k, filters)
         except Exception as e:
             self._log_error("search", e)
             return []
@@ -649,6 +663,41 @@ class GenericKBAdapter(BaseKBAdapter):
         return 0
 
 
+class MemoryKBAdapter(BaseKBAdapter):
+    """纯内存知识库适配器，用于测试和本地隔离验证。"""
+
+    def __init__(self, credential: Optional[KBCredential] = None):
+        super().__init__(credential or KBCredential(provider=KBProvider.MEMORY))
+        self._is_healthy = True
+
+    def search(self, query: str, top_k: int = 5, filters: Optional[Dict[str, Any]] = None) -> List[KBDocument]:
+        return self._search_cache(query, top_k, filters)
+
+    def get(self, doc_id: str) -> Optional[KBDocument]:
+        return self._cache.get(doc_id)
+
+    def save(self, doc: KBDocument) -> bool:
+        self._cache[doc.doc_id] = doc
+        return True
+
+    def update(self, doc_id: str, updates: Dict[str, Any]) -> bool:
+        if doc_id not in self._cache:
+            return False
+        doc = self._cache[doc_id]
+        for key, value in updates.items():
+            if hasattr(doc, key):
+                setattr(doc, key, value)
+        doc.updated_at = datetime.now()
+        return True
+
+    def delete(self, doc_id: str) -> bool:
+        return self._cache.pop(doc_id, None) is not None
+
+    def sync(self, since: Optional[datetime] = None) -> int:
+        self._last_sync_at = datetime.now()
+        return len(self._cache)
+
+
 # ---------------------------------------------------------------------------
 # 工厂函数
 # ---------------------------------------------------------------------------
@@ -677,6 +726,7 @@ def create_kb_adapter(provider: KBProvider, credential: Optional[KBCredential] =
         KBProvider.CONFLUENCE: ConfluenceKBAdapter,
         KBProvider.NOTION: NotionKBAdapter,
         KBProvider.GENERIC: GenericKBAdapter,
+        KBProvider.MEMORY: MemoryKBAdapter,
     }
     
     adapter_class = adapters.get(provider, GenericKBAdapter)

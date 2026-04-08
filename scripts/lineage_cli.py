@@ -25,13 +25,11 @@ _spec = importlib.util.spec_from_file_location("skill_lineage", _lineage_file)
 _mod  = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
 SkillLineage = _mod.SkillLineage
+resolve_default_db_path = _mod.resolve_default_db_path
 
-DB_PATH = (
-    "C:/Users/sdenilson/WorkBuddy/Claw/output/ai-memory-system"
-    "/engine/memory-bank/skill_lineage.db"
-)
+DB_PATH = resolve_default_db_path()
+OUT_FILE = _here / "output" / "lineage_cli_out.txt"
 
-OUT_FILE = Path("C:/Users/sdenilson/WorkBuddy/Claw/output/lineage_cli_out.txt")
 
 def _fmt(d: dict, detail: bool = False) -> str:
     eid   = d.get("id", "?")[:12]

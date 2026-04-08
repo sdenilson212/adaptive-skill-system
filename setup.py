@@ -5,7 +5,8 @@ with open("README.md", "r", encoding="utf-8") as f:
 
 setup(
     name="adaptive-skill-system",
-    version="1.0.0",
+    version="1.2.0",
+
     author="sdenilson212",
     description="三层递进 AI Skill 引擎 — 让 AI 在复杂问题上自动学习进化",
     long_description=long_description,
@@ -17,7 +18,13 @@ setup(
     extras_require={
         "dev": ["pytest>=7.0"],
     },
+    entry_points={
+        "console_scripts": [
+            "adaptive-skill-report=adaptive_skill.harness.cli:main",
+        ],
+    },
     classifiers=[
+
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: MIT License",
         "Operating System :: OS Independent",
